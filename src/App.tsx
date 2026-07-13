@@ -100,9 +100,19 @@ function relativeTime(updatedAt: number | null) {
   return `${Math.floor(seconds / 86_400)}일 전`;
 }
 
-/** Groups sessions by herdr workspace; sessions outside herdr fall into a trailing "기타" group.
- *  Pinned workspaces float to the top, keeping their relative order. */
-function groupSessions(sessions: SessionView[], pinned: string[]) {
+function workspaceDropTargetAt(clientX: number, clientY: number) {
+  const element = document.elementFromPoint(clientX, clientY);
+  const group = element?.closest<HTMLElement>("[data-workspace-key]");
+  const key = group?.dataset.workspaceKey;
+  if (!group || !key) return null;
+  const header = group.querySelector<HTMLElement>(".group-header-row");
+  const bounds = (header ?? group).getBoundingClientRect();
+  return { key, after: clientY > bounds.top + bounds.height / 2 };
+}
+
+/** Groups sessions by herdr workspace; pinned groups stay in the top band while the
+ *  user's persisted drag order decides the order within each band. */
+function groupSessions(sessions: SessionView[], pinned: string[], workspaceOrder: string[]) {
   const groups = new Map<string, { label: string; order: number; sessions: SessionView[] }>();
   for (const session of sessions) {
     const key = session.workspace_id ?? "__other__";
@@ -117,7 +127,18 @@ function groupSessions(sessions: SessionView[], pinned: string[]) {
   }
   return [...groups.entries()]
     .map(([key, group]) => ({ key, ...group, pinned: pinned.includes(key) }))
-    .sort((a, b) => Number(b.pinned) - Number(a.pinned) || a.order - b.order);
+    .sort((a, b) => {
+      const pinnedOrder = Number(b.pinned) - Number(a.pinned);
+      if (pinnedOrder) return pinnedOrder;
+      const aManual = workspaceOrder.indexOf(a.key);
+      const bManual = workspaceOrder.indexOf(b.key);
+      if (aManual >= 0 || bManual >= 0) {
+        if (aManual < 0) return 1;
+        if (bManual < 0) return -1;
+        if (aManual !== bManual) return aManual - bManual;
+      }
+      return a.order - b.order;
+    });
 }
 
 /** Pin/collapse choices are per-machine UI state, so localStorage is the whole store. */
@@ -131,16 +152,22 @@ function useStoredKeys(storageKey: string) {
       return [];
     }
   });
-  const toggle = useCallback(
-    (key: string) =>
+  const update = useCallback(
+    (updater: (current: string[]) => string[]) =>
       setKeys((current) => {
-        const next = current.includes(key) ? current.filter((k) => k !== key) : [...current, key];
+        const next = updater(current);
         localStorage.setItem(storageKey, JSON.stringify(next));
         return next;
       }),
     [storageKey],
   );
-  return [keys, toggle] as const;
+  const toggle = useCallback(
+    (key: string) => update((current) => (
+      current.includes(key) ? current.filter((item) => item !== key) : [...current, key]
+    )),
+    [update],
+  );
+  return [keys, toggle, update] as const;
 }
 
 function MarkdownMessage({ content, collapsible = false }: { content: string; collapsible?: boolean }) {
@@ -200,14 +227,18 @@ function App() {
   const [timeline, setTimeline] = useState<TimelineItem[] | null>(null);
   const [viewMode, setViewMode] = useState<"chat" | "terminal">("chat");
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
-  const [pinned, togglePinned] = useStoredKeys("rl.pinnedWorkspaces");
+  const [pinned, togglePinned, updatePinned] = useStoredKeys("rl.pinnedWorkspaces");
   const [collapsed, toggleCollapsed] = useStoredKeys("rl.collapsedWorkspaces");
+  const [workspaceOrder, , updateWorkspaceOrder] = useStoredKeys("rl.workspaceOrder");
+  const [dragTarget, setDragTarget] = useState<{ key: string; after: boolean } | null>(null);
   const fleetRefreshTimer = useRef<number | null>(null);
   const fleetRequestRef = useRef(0);
   const revisionRef = useRef<number>(0);
   const conversationRef = useRef<HTMLDivElement | null>(null);
   const terminalRef = useRef<HTMLPreElement | null>(null);
   const selectedIdRef = useRef<string | null>(null);
+  const pointerDragRef = useRef<{ key: string; pointerId: number; startY: number; active: boolean } | null>(null);
+  const suppressWorkspaceClickRef = useRef(false);
   selectedIdRef.current = selectedId;
 
   const message = selectedId ? drafts[selectedId] ?? "" : "";
@@ -252,8 +283,31 @@ function App() {
     () => sessions?.find((session) => session.id === selectedId) ?? null,
     [sessions, selectedId],
   );
-  const groups = useMemo(() => groupSessions(sessions ?? [], pinned), [sessions, pinned]);
-  const attentionCount = sessions?.filter((session) => session.status === "blocked").length ?? 0;
+  const groups = useMemo(
+    () => groupSessions(sessions ?? [], pinned, workspaceOrder),
+    [sessions, pinned, workspaceOrder],
+  );
+
+  const moveWorkspace = useCallback(
+    (targetKey: string, after: boolean) => {
+      const draggedKey = pointerDragRef.current?.key;
+      if (!draggedKey || draggedKey === targetKey) return;
+
+      const visibleOrder = groups.map((group) => group.key).filter((key) => key !== draggedKey);
+      const targetIndex = visibleOrder.indexOf(targetKey);
+      visibleOrder.splice(targetIndex + (after ? 1 : 0), 0, draggedKey);
+      updateWorkspaceOrder(() => visibleOrder);
+
+      // Crossing the pinned boundary should behave exactly like the visible drop:
+      // dragging into the pinned band pins the group, and dragging out unpins it.
+      const targetIsPinned = pinned.includes(targetKey);
+      updatePinned((current) => {
+        const withoutDragged = current.filter((key) => key !== draggedKey);
+        return targetIsPinned ? [...withoutDragged, draggedKey] : withoutDragged;
+      });
+    },
+    [groups, pinned, updatePinned, updateWorkspaceOrder],
+  );
 
   const scheduleFleetRefresh = useCallback(() => {
     if (fleetRefreshTimer.current !== null) return;
@@ -441,28 +495,70 @@ function App() {
           <button className="icon-button" aria-label="새로고침" onClick={() => void refreshFleet()}>↻</button>
         </div>
 
-        <div className={`attention-card ${attentionCount === 0 ? "all-clear" : ""}`}>
-          <div>
-            <span>{attentionCount === 0 ? "모든 세션 정상" : "내 확인 필요"}</span>
-            <strong>{attentionCount}</strong>
-          </div>
-          <p>
-            {attentionCount === 0
-              ? "답변이나 승인을 기다리는 세션이 없습니다."
-              : "에이전트가 답변이나 권한 승인을 기다리고 있어요."}
-          </p>
-        </div>
-
         <nav className="session-list" aria-label="에이전트 세션">
           {groups.map((group) => (
-            <div key={group.key}>
+            <section
+              key={group.key}
+              data-workspace-key={group.key}
+              className={`workspace-group ${dragTarget?.key === group.key ? (dragTarget.after ? "drop-after" : "drop-before") : ""}`}
+            >
               <div className="group-header-row">
                 <button
                   type="button"
                   className="group-header"
                   aria-expanded={!collapsed.includes(group.key)}
-                  onClick={() => toggleCollapsed(group.key)}
+                  aria-roledescription="드래그 가능한 워크스페이스"
+                  title="드래그해서 워크스페이스 순서 변경"
+                  onPointerDown={(event) => {
+                    if (event.button !== 0) return;
+                    pointerDragRef.current = {
+                      key: group.key,
+                      pointerId: event.pointerId,
+                      startY: event.clientY,
+                      active: false,
+                    };
+                    event.currentTarget.setPointerCapture(event.pointerId);
+                  }}
+                  onPointerMove={(event) => {
+                    const drag = pointerDragRef.current;
+                    if (!drag || drag.pointerId !== event.pointerId) return;
+                    if (!drag.active && Math.abs(event.clientY - drag.startY) > 5) {
+                      drag.active = true;
+                    }
+                    if (!drag.active) return;
+                    event.preventDefault();
+                    const target = workspaceDropTargetAt(event.clientX, event.clientY);
+                    setDragTarget(target && target.key !== drag.key ? target : null);
+                  }}
+                  onPointerUp={(event) => {
+                    const drag = pointerDragRef.current;
+                    if (!drag || drag.pointerId !== event.pointerId) return;
+                    const wasDragging = drag.active;
+                    if (wasDragging) {
+                      const target = workspaceDropTargetAt(event.clientX, event.clientY);
+                      if (target && target.key !== drag.key) moveWorkspace(target.key, target.after);
+                    }
+                    pointerDragRef.current = null;
+                    setDragTarget(null);
+                    suppressWorkspaceClickRef.current = wasDragging;
+                    window.setTimeout(() => {
+                      suppressWorkspaceClickRef.current = false;
+                    }, 0);
+                  }}
+                  onPointerCancel={() => {
+                    pointerDragRef.current = null;
+                    setDragTarget(null);
+                  }}
+                  onClick={(event) => {
+                    if (suppressWorkspaceClickRef.current) {
+                      event.preventDefault();
+                      return;
+                    }
+                    toggleCollapsed(group.key);
+                  }}
                 >
+                  <span className="drag-grip" aria-hidden="true">⠿</span>
+                  <span className="workspace-icon" aria-hidden="true" />
                   <span className="chevron" aria-hidden="true">
                     {collapsed.includes(group.key) ? "▸" : "▾"}
                   </span>
@@ -479,36 +575,39 @@ function App() {
                   {group.pinned ? "★" : "☆"}
                 </button>
               </div>
-              {!collapsed.includes(group.key) && group.sessions.map((session) => (
-                <button
-                  className={`session-item ${selectedId === session.id ? "selected" : ""}`}
-                  key={session.id}
-                  title={session.cwd}
-                  onClick={() => {
-                    setSelectedId(session.id);
-                    setMobileSidebarOpen(false);
-                  }}
-                >
-                  <span className={`provider-mark ${providerOf(session)}`}>
-                    {providerMarks[providerOf(session)]}
-                  </span>
-                  <span className="session-copy">
-                    <span className="session-title-row">
-                      {/* 그룹 헤더가 이미 workspace를 말해주므로 탭 이름만 */}
-                      <strong>{session.tab_label ?? session.display_name}</strong>
-                      <time>{relativeTime(session.updated_at)}</time>
-                    </span>
-                    <span className="session-summary">
-                      {session.branch ? `⎇ ${session.branch}` : shortPath(session.cwd)}
-                    </span>
-                    <span className="session-meta">
-                      <i className={`status-dot ${statusClass[session.status] ?? "unknown"}`} />
-                      {statusLabels[session.status] ?? session.status} · {shortPath(session.cwd)}
-                    </span>
-                  </span>
-                </button>
-              ))}
-            </div>
+              {!collapsed.includes(group.key) && (
+                <div className="workspace-children">
+                  {group.sessions.map((session) => (
+                    <button
+                      className={`session-item ${selectedId === session.id ? "selected" : ""}`}
+                      key={session.id}
+                      title={session.cwd}
+                      onClick={() => {
+                        setSelectedId(session.id);
+                        setMobileSidebarOpen(false);
+                      }}
+                    >
+                      <span className={`provider-mark ${providerOf(session)}`}>
+                        {providerMarks[providerOf(session)]}
+                      </span>
+                      <span className="session-copy">
+                        <span className="session-title-row">
+                          <strong>{session.tab_label ?? session.display_name}</strong>
+                          <time>{relativeTime(session.updated_at)}</time>
+                        </span>
+                        <span className="session-summary">
+                          {session.branch ? `⎇ ${session.branch}` : shortPath(session.cwd)}
+                        </span>
+                        <span className="session-meta">
+                          <i className={`status-dot ${statusClass[session.status] ?? "unknown"}`} />
+                          {statusLabels[session.status] ?? session.status} · {shortPath(session.cwd)}
+                        </span>
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </section>
           ))}
           {!sessions && !connectionError && <div className="sidebar-empty">herdr 세션을 불러오는 중…</div>}
           {sessions?.length === 0 && <div className="sidebar-empty">실행 중인 에이전트가 없습니다.</div>}
