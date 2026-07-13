@@ -181,23 +181,30 @@ fn resolve_display_name(
 }
 
 fn merge_status(registry_status: Option<&str>, herdr_status: Option<&str>) -> String {
+    // herdr's socket authors the full blocked/working/done/idle/unknown vocabulary, so keep it
+    // verbatim — but let the registry's own busy flag promote to "working" (it is Claude Code's
+    // self-report, more reliable than screen detection when the two disagree).
     if herdr_status == Some("blocked") {
         return "blocked".to_string();
     }
-    if registry_status == Some("busy") {
+    if herdr_status == Some("working") || registry_status == Some("busy") {
         return "working".to_string();
     }
-    if herdr_status == Some("working") {
-        return "working".to_string();
+    match herdr_status {
+        Some("done") => "done".to_string(),
+        Some("idle") => "idle".to_string(),
+        Some("unknown") => "unknown".to_string(),
+        _ => "idle".to_string(),
     }
-    "idle".to_string()
 }
 
 fn status_rank(status: &str) -> u8 {
     match status {
         "blocked" => 0,
         "working" => 1,
-        _ => 2,
+        "done" => 2,
+        "idle" => 3,
+        _ => 4,
     }
 }
 
@@ -812,6 +819,8 @@ fn send_message(pane_id: String, text: String) -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    use tauri::{Emitter, Manager};
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
@@ -823,12 +832,54 @@ pub fn run() {
             detect_providers,
             event_stream::herdr_event_status
         ])
+        .on_menu_event(|app, event| {
+            // Native "Settings…" (Cmd+,) just tells the webview to open its settings panel.
+            if event.id().as_ref() == "settings" {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                    let _ = window.emit("open-settings", ());
+                }
+            }
+        })
         .setup(|app| {
-            use tauri::menu::{Menu, MenuItem};
+            use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
             use tauri::tray::TrayIconBuilder;
-            use tauri::Manager;
 
             event_stream::start(app.handle().clone());
+
+            // macOS application menu: the app-name submenu carries About, Settings… (Cmd+,), Quit.
+            let settings_item =
+                MenuItem::with_id(app, "settings", "Settings…", true, Some("CmdOrCtrl+,"))?;
+            let app_menu = Submenu::with_items(
+                app,
+                "HerdDeck",
+                true,
+                &[
+                    &PredefinedMenuItem::about(app, None, None)?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &settings_item,
+                    &PredefinedMenuItem::separator(app)?,
+                    &PredefinedMenuItem::hide(app, None)?,
+                    &PredefinedMenuItem::quit(app, None)?,
+                ],
+            )?;
+            let edit_menu = Submenu::with_items(
+                app,
+                "Edit",
+                true,
+                &[
+                    &PredefinedMenuItem::undo(app, None)?,
+                    &PredefinedMenuItem::redo(app, None)?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &PredefinedMenuItem::cut(app, None)?,
+                    &PredefinedMenuItem::copy(app, None)?,
+                    &PredefinedMenuItem::paste(app, None)?,
+                    &PredefinedMenuItem::select_all(app, None)?,
+                ],
+            )?;
+            let menu_bar = Menu::with_items(app, &[&app_menu, &edit_menu])?;
+            app.set_menu(menu_bar)?;
 
             let open_item = MenuItem::with_id(app, "open", "열기", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "quit", "종료", true, None::<&str>)?;

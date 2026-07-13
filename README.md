@@ -1,4 +1,4 @@
-# remote legion
+# HerdDeck
 
 Herdr가 감지한 Claude Code, Codex CLI, Gemini CLI 세션을 한곳에서 확인하고 대화하는 Tauri 데스크톱 앱입니다.
 

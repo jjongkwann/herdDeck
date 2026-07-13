@@ -4,6 +4,9 @@ import { listen } from "@tauri-apps/api/event";
 import { marked } from "marked";
 import DOMPurify from "dompurify";
 import "./App.css";
+import claudeLogo from "./assets/providers/claude.svg";
+import codexLogo from "./assets/providers/codex.svg";
+import geminiLogo from "./assets/providers/gemini.svg";
 
 interface SessionView {
   id: string;
@@ -56,20 +59,88 @@ const providerMarks: Record<string, string> = {
   other: "A",
 };
 
-// herdr's states, rendered with the deck's visual vocabulary.
-const statusClass: Record<string, string> = {
-  working: "running",
-  blocked: "waiting",
-  idle: "idle",
-  unknown: "unknown",
+// Brand SVGs on their app-icon chip: Claude = white burst on terracotta, OpenAI = white
+// blossom on black, Gemini = 4-color spark. Rendered as plain images (consistent light/dark).
+const providerLogos: Record<string, string> = {
+  claude: claudeLogo,
+  codex: codexLogo,
+  gemini: geminiLogo,
 };
 
-const statusLabels: Record<string, string> = {
-  working: "실행 중",
-  blocked: "입력 대기",
-  idle: "유휴",
-  unknown: "알 수 없음",
+function ProviderLogo({ provider }: { provider: string }) {
+  const src = providerLogos[provider];
+  if (src) return <img className="provider-logo" src={src} alt="" />;
+  return <>{providerMarks[provider] ?? providerMarks.other}</>;
+}
+
+// herdr's status vocabulary, ported 1:1 from src/ui/status.rs. The backend now passes herdr's
+// semantic state through, so blocked/working/done/idle/unknown all arrive verbatim.
+type HerdrState = "blocked" | "working" | "done" | "idle" | "unknown";
+
+// The braille spinner herdr animates for a working agent (src/ui.rs spinner_frame).
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+// agent_icon(): the leading glyph on an agent row. Only "working" animates.
+function agentIcon(state: HerdrState, tick: number): string {
+  switch (state) {
+    case "blocked":
+      return "◉";
+    case "working":
+      return SPINNER_FRAMES[tick % SPINNER_FRAMES.length];
+    case "done":
+      return "●";
+    case "idle":
+      return "✓";
+    default:
+      return "○";
+  }
+}
+
+// state_dot(): the rolled-up dot herdr paints on a space (our group header).
+function stateDot(state: HerdrState): string {
+  if (state === "idle") return "○";
+  if (state === "unknown") return "·";
+  return "●";
+}
+
+const stateLabels: Record<HerdrState, string> = {
+  blocked: "blocked",
+  working: "working",
+  done: "done",
+  idle: "idle",
+  unknown: "idle",
 };
+
+const stateColorClass: Record<HerdrState, string> = {
+  blocked: "st-red",
+  working: "st-yellow",
+  done: "st-teal",
+  idle: "st-green",
+  unknown: "st-gray",
+};
+
+// herdr rolls a space up to its most urgent agent: blocked > working > done > idle.
+const STATE_RANK: Record<HerdrState, number> = {
+  blocked: 0,
+  working: 1,
+  done: 2,
+  idle: 3,
+  unknown: 4,
+};
+
+function rollUpState(states: HerdrState[]): HerdrState {
+  return states.reduce<HerdrState>(
+    (worst, state) => (STATE_RANK[state] < STATE_RANK[worst] ? state : worst),
+    "idle",
+  );
+}
+
+// The backend hands us herdr's state string directly; normalize anything unexpected to unknown.
+function asState(status: string): HerdrState {
+  return status === "blocked" || status === "working" || status === "done" || status === "idle"
+    ? status
+    : "unknown";
+}
 
 const COLLAPSED_MESSAGE_HEIGHT = 190;
 
@@ -231,6 +302,13 @@ function App() {
   const [collapsed, toggleCollapsed] = useStoredKeys("rl.collapsedWorkspaces");
   const [workspaceOrder, , updateWorkspaceOrder] = useStoredKeys("rl.workspaceOrder");
   const [dragTarget, setDragTarget] = useState<{ key: string; after: boolean } | null>(null);
+  const [theme, setTheme] = useState<"light" | "dark">(() => {
+    const saved = localStorage.getItem("rl.theme");
+    if (saved === "light" || saved === "dark") return saved;
+    return window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+  });
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [spinnerTick, setSpinnerTick] = useState(0);
   const fleetRefreshTimer = useRef<number | null>(null);
   const fleetRequestRef = useRef(0);
   const revisionRef = useRef<number>(0);
@@ -242,6 +320,12 @@ function App() {
   selectedIdRef.current = selectedId;
 
   const message = selectedId ? drafts[selectedId] ?? "" : "";
+
+  // Theme lives on <html data-theme> so every CSS token flips at once; persisted per machine.
+  useLayoutEffect(() => {
+    document.documentElement.setAttribute("data-theme", theme);
+    localStorage.setItem("rl.theme", theme);
+  }, [theme]);
 
   const refreshFleet = useCallback(async () => {
     const requestId = ++fleetRequestRef.current;
@@ -287,6 +371,20 @@ function App() {
     () => groupSessions(sessions ?? [], pinned, workspaceOrder),
     [sessions, pinned, workspaceOrder],
   );
+  const hasWorking = useMemo(
+    () => (sessions ?? []).some((session) => session.status === "working"),
+    [sessions],
+  );
+
+  // Advance the braille spinner only while something is actually working.
+  useEffect(() => {
+    if (!hasWorking) return;
+    const timer = window.setInterval(
+      () => setSpinnerTick((tick) => (tick + 1) % SPINNER_FRAMES.length),
+      90,
+    );
+    return () => window.clearInterval(timer);
+  }, [hasWorking]);
 
   const moveWorkspace = useCallback(
     (targetKey: string, after: boolean) => {
@@ -452,6 +550,27 @@ function App() {
     return () => window.removeEventListener("keydown", closeOnEscape);
   }, [mobileSidebarOpen]);
 
+  // The native "Settings…" menu item and Cmd/Ctrl+, open the panel; Escape closes it.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void listen("open-settings", () => setSettingsOpen(true)).then((cleanup) => {
+      unlisten = cleanup;
+    });
+    const onKeyDown = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key === ",") {
+        event.preventDefault();
+        setSettingsOpen(true);
+      } else if (event.key === "Escape") {
+        setSettingsOpen(false);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      unlisten?.();
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, []);
+
   async function submitMessage(event: FormEvent) {
     event.preventDefault();
     const body = message.trim();
@@ -481,9 +600,9 @@ function App() {
     <div className="app-shell">
       <aside className={`sidebar ${mobileSidebarOpen ? "mobile-open" : ""}`}>
         <div className="brand-row">
-          <div className="brand-mark">R</div>
+          <div className="brand-mark">H</div>
           <div>
-            <strong>remote legion</strong>
+            <strong>HerdDeck</strong>
             <span className={connectionError ? "connection-bad" : "connection-good"}>
               {connectionError
                 ? "herdr 연결 끊김"
@@ -493,10 +612,26 @@ function App() {
             </span>
           </div>
           <button className="icon-button" aria-label="새로고침" onClick={() => void refreshFleet()}>↻</button>
+          <button
+            type="button"
+            className="icon-button"
+            aria-label="설정"
+            aria-expanded={settingsOpen}
+            onClick={() => setSettingsOpen((open) => !open)}
+          >
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <circle cx="12" cy="12" r="3" />
+              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+            </svg>
+          </button>
         </div>
 
+        {/* Settings render as a modal at the app root (see below). */}
+
         <nav className="session-list" aria-label="에이전트 세션">
-          {groups.map((group) => (
+          {groups.map((group) => {
+            const groupState = rollUpState(group.sessions.map((session) => asState(session.status)));
+            return (
             <section
               key={group.key}
               data-workspace-key={group.key}
@@ -562,6 +697,9 @@ function App() {
                   <span className="chevron" aria-hidden="true">
                     {collapsed.includes(group.key) ? "▸" : "▾"}
                   </span>
+                  <span className={`group-dot ${stateColorClass[groupState]}`} aria-hidden="true">
+                    {stateDot(groupState)}
+                  </span>
                   <span className="group-name">{group.label}</span>
                   <span className="group-count">{group.sessions.length}</span>
                 </button>
@@ -577,7 +715,9 @@ function App() {
               </div>
               {!collapsed.includes(group.key) && (
                 <div className="workspace-children">
-                  {group.sessions.map((session) => (
+                  {group.sessions.map((session) => {
+                    const ds = asState(session.status);
+                    return (
                     <button
                       className={`session-item ${selectedId === session.id ? "selected" : ""}`}
                       key={session.id}
@@ -588,7 +728,7 @@ function App() {
                       }}
                     >
                       <span className={`provider-mark ${providerOf(session)}`}>
-                        {providerMarks[providerOf(session)]}
+                        <ProviderLogo provider={providerOf(session)} />
                       </span>
                       <span className="session-copy">
                         <span className="session-title-row">
@@ -599,16 +739,21 @@ function App() {
                           {session.branch ? `⎇ ${session.branch}` : shortPath(session.cwd)}
                         </span>
                         <span className="session-meta">
-                          <i className={`status-dot ${statusClass[session.status] ?? "unknown"}`} />
-                          {statusLabels[session.status] ?? session.status} · {shortPath(session.cwd)}
+                          <span className={`agent-glyph ${stateColorClass[ds]}`} aria-hidden="true">
+                            {agentIcon(ds, spinnerTick)}
+                          </span>
+                          <span className={`state-text ${stateColorClass[ds]}`}>{stateLabels[ds]}</span>
+                          <span className="meta-dim"> · {session.agent}</span>
                         </span>
                       </span>
                     </button>
-                  ))}
+                    );
+                  })}
                 </div>
               )}
             </section>
-          ))}
+            );
+          })}
           {!sessions && !connectionError && <div className="sidebar-empty">herdr 세션을 불러오는 중…</div>}
           {sessions?.length === 0 && <div className="sidebar-empty">실행 중인 에이전트가 없습니다.</div>}
         </nav>
@@ -645,15 +790,15 @@ function App() {
                 aria-expanded={mobileSidebarOpen}
                 onClick={() => setMobileSidebarOpen(true)}
               >☰</button>
-              <div className="mobile-brand"><div className="brand-mark">R</div></div>
+              <div className="mobile-brand"><div className="brand-mark">H</div></div>
               <div className={`provider-mark large ${providerOf(selected)}`}>
-                {providerMarks[providerOf(selected)]}
+                <ProviderLogo provider={providerOf(selected)} />
               </div>
               <div className="topbar-title">
                 <div>
                   <h1>{selected.display_name}</h1>
-                  <span className={`status-pill ${statusClass[selected.status] ?? "unknown"}`}>
-                    <i /> {statusLabels[selected.status] ?? selected.status}
+                  <span className={`status-pill ${stateColorClass[asState(selected.status)]}`}>
+                    <i /> {stateLabels[asState(selected.status)]}
                   </span>
                 </div>
                 <p>
@@ -670,7 +815,7 @@ function App() {
               <div className="briefing-grid">
                 <div>
                   <span>현재</span>
-                  <strong>{statusLabels[selected.status] ?? selected.status}</strong>
+                  <strong className={stateColorClass[asState(selected.status)]}>{stateLabels[asState(selected.status)]}</strong>
                 </div>
                 <div>
                   <span>작업공간</span>
@@ -788,13 +933,44 @@ function App() {
           </>
         ) : (
           <section className="empty-workspace">
-            <div className="brand-mark">R</div>
+            <div className="brand-mark">H</div>
             <h1>{connectionError ? "herdr에 연결할 수 없습니다" : "실행 중인 세션이 없습니다"}</h1>
             <p>{connectionError ?? "herdr pane에서 Claude Code를 실행하면 여기에 나타납니다."}</p>
             <button onClick={() => void refreshFleet()}>다시 연결</button>
           </section>
         )}
       </main>
+
+      {settingsOpen && (
+        <div className="settings-overlay" role="presentation" onClick={() => setSettingsOpen(false)}>
+          <div
+            className="settings-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label="설정"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="settings-modal-head">
+              <h2>설정</h2>
+              <button type="button" className="icon-button" aria-label="닫기" onClick={() => setSettingsOpen(false)}>✕</button>
+            </div>
+            <div className="settings-row">
+              <div className="settings-row-label">
+                <span className="settings-row-title">다크 모드</span>
+                <span className="settings-row-sub">어두운 테마로 전환 · ⌘,</span>
+              </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={theme === "dark"}
+                aria-label="다크 모드"
+                className={`theme-toggle ${theme === "dark" ? "on" : ""}`}
+                onClick={() => setTheme((current) => (current === "dark" ? "light" : "dark"))}
+              />
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

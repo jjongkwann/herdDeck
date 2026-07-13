@@ -87,7 +87,7 @@ fn read_json_line(reader: &mut BufReader<UnixStream>) -> Result<Value, String> {
 #[cfg(unix)]
 fn send_input_request(pane_id: &str, text: &str) -> Value {
     json!({
-        "id": "remote-legion:send-input",
+        "id": "herddeck:send-input",
         "method": "pane.send_input",
         "params": { "pane_id": pane_id, "text": text, "keys": ["enter"] }
     })
@@ -165,7 +165,7 @@ fn subscribe_once(app: &AppHandle) -> Result<(), String> {
 
     write_request(
         &mut snapshot_stream,
-        &json!({ "id": "remote-legion:snapshot", "method": "session.snapshot", "params": {} }),
+        &json!({ "id": "herddeck:snapshot", "method": "session.snapshot", "params": {} }),
     )?;
     let snapshot = read_json_line(&mut snapshot_reader)?;
     let pane_ids: Vec<String> = snapshot
@@ -198,7 +198,7 @@ fn subscribe_once(app: &AppHandle) -> Result<(), String> {
     write_request(
         &mut stream,
         &json!({
-            "id": "remote-legion:subscribe",
+            "id": "herddeck:subscribe",
             "method": "events.subscribe",
             "params": { "subscriptions": subscriptions }
         }),
@@ -234,7 +234,7 @@ pub fn start(app: AppHandle) {
     #[cfg(unix)]
     thread::spawn(move || loop {
         if let Err(error) = subscribe_once(&app) {
-            eprintln!("remote-legion herdr event stream: {error}");
+            eprintln!("herddeck herdr event stream: {error}");
             set_status(false, Some(error.clone()));
             let _ = app.emit(
                 "herdr-connection",
