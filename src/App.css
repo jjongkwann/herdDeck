@@ -352,6 +352,19 @@ button { color: inherit; }
 .tool-card > div time { color: var(--muted); }
 .tool-card pre { margin: 0; padding: 9px 11px; overflow: auto; color: var(--muted); font: 11px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
 
+.prompt-bar { position: fixed; z-index: 5; right: 0; bottom: 112px; width: calc(100% - 326px); padding: 0 34px; }
+.prompt-bar-inner { width: min(740px, 100%); margin: 0 auto; display: flex; flex-direction: column; gap: 9px; padding: 12px 14px; border: 1px solid var(--st-red); border-radius: 15px; background: var(--st-red-bg); box-shadow: 0 11px 35px var(--shadow); }
+.prompt-bar-title { color: var(--st-red); font-size: 10px; font-weight: 600; letter-spacing: .02em; }
+.prompt-choices { display: flex; flex-direction: column; gap: 5px; }
+.prompt-choice { display: flex; gap: 9px; align-items: baseline; padding: 7px 10px; border: 1px solid var(--panel-border); border-radius: 9px; background: var(--surface); color: var(--ink); font-size: 12px; text-align: left; cursor: pointer; }
+.prompt-choice.current { border-color: var(--st-red); }
+.prompt-choice b { flex: none; width: 12px; color: var(--st-red); font-size: 11px; }
+.prompt-choice span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.prompt-choice:disabled { cursor: default; opacity: .45; }
+.prompt-nav { display: flex; gap: 6px; }
+.prompt-nav button { padding: 5px 10px; border: 1px solid var(--panel-border); border-radius: 8px; background: var(--surface); color: var(--muted); font-size: 11px; cursor: pointer; }
+.prompt-nav button:disabled { cursor: default; opacity: .45; }
+
 .composer { position: fixed; z-index: 4; right: 0; bottom: 0; width: calc(100% - 326px); padding: 18px 34px 25px; background: linear-gradient(0deg, var(--bg) 70%, transparent); }
 .composer-inner { width: min(740px, 100%); min-height: 79px; margin: 0 auto; display: flex; gap: 12px; padding: 14px 14px 12px 17px; border: 1px solid var(--panel-border); border-radius: 15px; background: var(--surface); box-shadow: 0 11px 35px var(--shadow); }
 .composer textarea { flex: 1; height: 50px; resize: none; border: 0; outline: 0; background: transparent; color: var(--ink); font-size: 13px; line-height: 1.55; }

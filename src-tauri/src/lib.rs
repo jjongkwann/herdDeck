@@ -1288,6 +1288,34 @@ fn send_message(pane_id: String, text: String) -> Result<(), String> {
     event_stream::send_text_and_enter(&pane_id, text)
 }
 
+/// herdr accepts any key name here (ctrl+c, esc, letters…). We don't: the choice buttons only ever
+/// need a digit or a cursor move, and the labels they are built from come from agent-rendered
+/// screen text, which is adversarial input.
+fn key_allowed(key: &str) -> bool {
+    matches!(key, "up" | "down" | "enter" | "esc")
+        || matches!(key.as_bytes(), [b'1'..=b'9'])
+}
+
+#[tauri::command]
+fn send_keys(pane_id: String, keys: Vec<String>) -> Result<(), String> {
+    validate_pane_id(&pane_id)?;
+    if keys.is_empty() || keys.len() > 4 {
+        return Err("키 개수가 올바르지 않습니다".to_string());
+    }
+    if let Some(bad) = keys.iter().find(|k| !key_allowed(k)) {
+        return Err(format!("허용되지 않은 키: {bad}"));
+    }
+    if !read_herdr_snapshot()
+        .agents
+        .iter()
+        .any(|a| a.pane_id == pane_id)
+    {
+        return Err("이 세션의 pane이 더 이상 존재하지 않습니다".to_string());
+    }
+
+    event_stream::send_keys(&pane_id, &keys)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     use tauri::{Emitter, Manager};
@@ -1300,6 +1328,7 @@ pub fn run() {
             get_timeline_revision,
             read_pane,
             send_message,
+            send_keys,
             detect_providers,
             event_stream::herdr_event_status
         ])
@@ -1513,6 +1542,18 @@ mod tests {
             "",
         ] {
             assert!(validate_pane_id(bad).is_err(), "expected error for {bad:?}");
+        }
+    }
+
+    #[test]
+    fn only_choice_digits_and_prompt_navigation_are_sendable_keys() {
+        for good in ["1", "9", "up", "down", "enter", "esc"] {
+            assert!(key_allowed(good), "expected {good:?} to be allowed");
+        }
+        // "0" is never a choice number, and the rest would let screen-derived buttons
+        // interrupt, background, or type into a live agent.
+        for bad in ["0", "10", "", "ctrl+c", "ctrl+z", "tab", "y", "q", "escape"] {
+            assert!(!key_allowed(bad), "expected {bad:?} to be rejected");
         }
     }
 

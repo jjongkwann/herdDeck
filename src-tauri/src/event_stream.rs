@@ -26,8 +26,13 @@
 //!
 //! # Writes
 //!
-//! `send_text_and_enter` is the only way anything leaves this app. Every other backend call is
-//! read-only.
+//! Two write paths, and nothing else here leaves the app:
+//!
+//! - `send_text_and_enter` — a chat message: text plus Enter, in one request.
+//! - `send_keys` — raw key presses with **no** trailing Enter, for answering an agent's
+//!   blocked prompt. See its doc comment for why the Enter must not be there.
+//!
+//! Every other backend call is read-only.
 
 use serde::Serialize;
 #[cfg(unix)]
@@ -124,10 +129,18 @@ fn send_input_request(pane_id: &str, text: &str) -> Value {
     })
 }
 
-/// Sends text and Enter in one server request. Protocol 16's pane.send_input applies
-/// `text` and `keys` together, avoiding the timing race between two CLI subprocesses.
 #[cfg(unix)]
-pub fn send_text_and_enter(pane_id: &str, text: &str) -> Result<(), String> {
+fn send_keys_request(pane_id: &str, keys: &[String]) -> Value {
+    json!({
+        "id": "herddeck:send-keys",
+        "method": "pane.send_keys",
+        "params": { "pane_id": pane_id, "keys": keys }
+    })
+}
+
+/// One request, one response, on a throwaway connection.
+#[cfg(unix)]
+fn write_once(request: &Value) -> Result<(), String> {
     let path = socket_path()?;
     let mut stream = UnixStream::connect(&path)
         .map_err(|error| format!("Herdr socket 연결 실패 ({}): {error}", path.display()))?;
@@ -136,7 +149,7 @@ pub fn send_text_and_enter(pane_id: &str, text: &str) -> Result<(), String> {
         .map_err(|error| format!("Herdr socket 복제 실패: {error}"))?;
     let mut reader = BufReader::new(reader_stream);
 
-    write_request(&mut stream, &send_input_request(pane_id, text))?;
+    write_request(&mut stream, request)?;
     let response = read_json_line(&mut reader)?;
     if let Some(error) = response.get("error") {
         let message = error
@@ -151,8 +164,30 @@ pub fn send_text_and_enter(pane_id: &str, text: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Sends text and Enter in one server request. Protocol 16's pane.send_input applies
+/// `text` and `keys` together, avoiding the timing race between two CLI subprocesses.
+#[cfg(unix)]
+pub fn send_text_and_enter(pane_id: &str, text: &str) -> Result<(), String> {
+    write_once(&send_input_request(pane_id, text))
+}
+
+/// Sends key presses with no trailing Enter — deliberately, unlike `send_text_and_enter`.
+///
+/// A numbered choice in Claude/Codex/Gemini confirms on the digit alone (verified against all
+/// three); an Enter after it would fall through to whatever prompt comes next, and since every
+/// one of them defaults its cursor to "Yes", a queued second approval would auto-confirm.
+#[cfg(unix)]
+pub fn send_keys(pane_id: &str, keys: &[String]) -> Result<(), String> {
+    write_once(&send_keys_request(pane_id, keys))
+}
+
 #[cfg(not(unix))]
 pub fn send_text_and_enter(_pane_id: &str, _text: &str) -> Result<(), String> {
+    Err("이 플랫폼의 Herdr 입력은 아직 지원되지 않습니다".to_string())
+}
+
+#[cfg(not(unix))]
+pub fn send_keys(_pane_id: &str, _keys: &[String]) -> Result<(), String> {
     Err("이 플랫폼의 Herdr 입력은 아직 지원되지 않습니다".to_string())
 }
 
@@ -315,5 +350,14 @@ mod tests {
         assert_eq!(request["params"]["pane_id"], "w1:p2");
         assert_eq!(request["params"]["text"], "진행해줘");
         assert_eq!(request["params"]["keys"], json!(["enter"]));
+    }
+
+    #[test]
+    fn send_keys_request_carries_no_text_and_no_added_enter() {
+        let request = send_keys_request("w1:p2", &["3".to_string()]);
+        assert_eq!(request["method"], "pane.send_keys");
+        assert_eq!(request["params"]["pane_id"], "w1:p2");
+        assert_eq!(request["params"]["keys"], json!(["3"]));
+        assert!(request["params"].get("text").is_none());
     }
 }

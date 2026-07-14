@@ -367,6 +367,30 @@ function MarkdownMessage({ content, collapsible = false }: { content: string; co
   );
 }
 
+type Choice = { key: string; label: string; active: boolean };
+
+// All three agents draw a blocked prompt as a numbered menu, each with its own cursor glyph and
+// box chrome: Claude "❯ 1. Yes", Codex "› 1. Yes, proceed (y)", Gemini "│ ● 1. Allow once".
+const CHOICE_LINE = /^[\s│]*([❯›●▶])?\s*([1-9])\.\s+(\S.*?)\s*│?\s*$/;
+
+// Last numbered run wins — the live prompt sits at the bottom, above only dead scrollback.
+function parseChoices(screen: string | null): Choice[] {
+  if (!screen) return [];
+  let run: Choice[] = [];
+  let menu: Choice[] = [];
+  for (const line of screen.split("\n")) {
+    const hit = CHOICE_LINE.exec(line);
+    if (!hit) continue;
+    const number = Number(hit[2]);
+    const choice = { key: hit[2], label: hit[3], active: Boolean(hit[1]) };
+    if (number === run.length + 1) run.push(choice);
+    else if (number === 1) run = [choice];
+    else continue;
+    if (run.length >= 2) menu = run;
+  }
+  return menu;
+}
+
 function App() {
   const [sessions, setSessions] = useState<SessionView[] | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -593,12 +617,38 @@ function App() {
     void refreshTimeline();
   }, [refreshTimeline, selected?.id]);
 
+  // Chat view doesn't need the pane text — except while blocked, where the prompt only
+  // exists on screen. herdr reports the state; the choices are nowhere but the terminal.
+  const blocked = selected ? asState(selected.status) === "blocked" : false;
+
   useEffect(() => {
-    if (viewMode !== "terminal") return;
+    if (viewMode !== "terminal" && !blocked) return;
     void refreshOutput();
     const interval = window.setInterval(() => void refreshOutput(), 2_000);
     return () => window.clearInterval(interval);
-  }, [refreshOutput, viewMode]);
+  }, [blocked, refreshOutput, viewMode]);
+
+  const choices = useMemo(() => (blocked ? parseChoices(output) : []), [blocked, output]);
+
+  const sendKeys = useCallback(
+    async (keys: string[]) => {
+      const targetSessionId = selected?.id;
+      const targetPaneId = selected?.pane_id;
+      if (!targetSessionId || !targetPaneId || sending) return;
+      setSending(true);
+      try {
+        await invoke("send_keys", { paneId: targetPaneId, keys });
+        if (selectedIdRef.current === targetSessionId) setOutputError(null);
+        window.setTimeout(() => void refreshOutput(), 300);
+        window.setTimeout(() => void refreshFleet(), 600);
+      } catch (error) {
+        if (selectedIdRef.current === targetSessionId) setOutputError(String(error));
+      } finally {
+        setSending(false);
+      }
+    },
+    [refreshFleet, refreshOutput, selected?.id, selected?.pane_id, sending],
+  );
 
   // Re-parsing the transcript every second is wasteful; check its mtime instead.
   useEffect(() => {
@@ -1046,6 +1096,38 @@ function App() {
                 <div className="output-state">최근 출력을 불러오는 중…</div>
               )}
             </section>
+
+            {blocked && selected.pane_id && (
+              <div className="prompt-bar">
+                <div className="prompt-bar-inner">
+                  <span className="prompt-bar-title">에이전트가 응답을 기다리는 중</span>
+                  {choices.length > 0 && (
+                    <div className="prompt-choices">
+                      {choices.map((choice) => (
+                        <button
+                          key={choice.key}
+                          type="button"
+                          className={choice.active ? "prompt-choice current" : "prompt-choice"}
+                          disabled={sending}
+                          onClick={() => void sendKeys([choice.key])}
+                        >
+                          <b>{choice.key}</b>
+                          <span>{choice.label}</span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  {/* The parser can miss a prompt shape we haven't seen; arrows and Enter drive
+                      any of the three menus without reading a single line of it. */}
+                  <div className="prompt-nav">
+                    <button type="button" disabled={sending} onClick={() => void sendKeys(["up"])} aria-label="위로">↑</button>
+                    <button type="button" disabled={sending} onClick={() => void sendKeys(["down"])} aria-label="아래로">↓</button>
+                    <button type="button" disabled={sending} onClick={() => void sendKeys(["enter"])}>⏎ 선택</button>
+                    <button type="button" disabled={sending} onClick={() => void sendKeys(["esc"])}>esc 취소</button>
+                  </div>
+                </div>
+              </div>
+            )}
 
             <form className="composer" onSubmit={submitMessage}>
               <div className="composer-inner">
