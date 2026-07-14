@@ -393,6 +393,8 @@ function App() {
   const [spinnerTick, setSpinnerTick] = useState(0);
   const [listScrolling, setListScrolling] = useState(false);
   const scrollIdleTimer = useRef<number | null>(null);
+  const listRef = useRef<HTMLElement | null>(null);
+  const [offscreenBlocked, setOffscreenBlocked] = useState({ above: 0, below: 0 });
   const fleetRefreshTimer = useRef<number | null>(null);
   const fleetRequestRef = useRef(0);
   const revisionRef = useRef<number>(0);
@@ -465,6 +467,47 @@ function App() {
   const hasWorking = useMemo(
     () => (sessions ?? []).some((session) => session.status === "working"),
     [sessions],
+  );
+
+  // blocked is the one state the user must act on, so it must never hide: markers carry how many
+  // blocked agents they stand for (a session row 1, a collapsed group all the ones it swallows),
+  // and anything scrolled out of the list turns into a peek pill at that edge.
+  const blockedMarkers = useCallback((direction?: "above" | "below") => {
+    const list = listRef.current;
+    if (!list) return [] as HTMLElement[];
+    const bounds = list.getBoundingClientRect();
+    return [...list.querySelectorAll<HTMLElement>("[data-blocked]")].filter((marker) => {
+      const rect = marker.getBoundingClientRect();
+      if (direction === "above") return rect.bottom < bounds.top + 4;
+      if (direction === "below") return rect.top > bounds.bottom - 4;
+      return true;
+    });
+  }, []);
+
+  const countBlocked = (markers: HTMLElement[]) =>
+    markers.reduce((sum, marker) => sum + (Number(marker.dataset.blocked) || 0), 0);
+
+  const syncOffscreenBlocked = useCallback(() => {
+    const above = countBlocked(blockedMarkers("above"));
+    const below = countBlocked(blockedMarkers("below"));
+    setOffscreenBlocked((prev) =>
+      prev.above === above && prev.below === below ? prev : { above, below },
+    );
+  }, [blockedMarkers]);
+
+  useEffect(() => {
+    syncOffscreenBlocked();
+    window.addEventListener("resize", syncOffscreenBlocked);
+    return () => window.removeEventListener("resize", syncOffscreenBlocked);
+  }, [syncOffscreenBlocked, groups, collapsed]);
+
+  const scrollToBlocked = useCallback(
+    (direction: "above" | "below") => {
+      const hits = blockedMarkers(direction);
+      const target = direction === "above" ? hits[hits.length - 1] : hits[0];
+      target?.scrollIntoView({ block: "center", behavior: "smooth" });
+    },
+    [blockedMarkers],
   );
 
   // Advance the braille spinner only while something is actually working.
@@ -714,28 +757,53 @@ function App() {
 
         {/* Styling a WebKit scrollbar at all costs it the OS overlay behavior, so the
             "only while scrolling" fade is driven here instead. */}
+        <div className="session-pane">
+        {(["above", "below"] as const).map((direction) =>
+          offscreenBlocked[direction] > 0 ? (
+            <button
+              key={direction}
+              type="button"
+              className={`blocked-peek ${direction}`}
+              onClick={() => scrollToBlocked(direction)}
+            >
+              <span className="peek-arrow" aria-hidden="true">{direction === "above" ? "▲" : "▼"}</span>
+              <span className="peek-dot" aria-hidden="true">◉</span>
+              {offscreenBlocked[direction]}개 대기 중
+            </button>
+          ) : null,
+        )}
         <nav
+          ref={listRef}
           className={`session-list ${listScrolling ? "scrolling" : ""}`}
           aria-label="에이전트 세션"
           onScroll={() => {
             setListScrolling(true);
+            syncOffscreenBlocked();
             if (scrollIdleTimer.current !== null) window.clearTimeout(scrollIdleTimer.current);
             scrollIdleTimer.current = window.setTimeout(() => setListScrolling(false), 700);
           }}
         >
           {groups.map((group) => {
             const groupState = rollUpState(group.sessions.map((session) => asState(session.status)));
+            const blockedCount = group.sessions.filter(
+              (session) => asState(session.status) === "blocked",
+            ).length;
+            const groupCollapsed = collapsed.includes(group.key);
             return (
             <section
               key={group.key}
               data-workspace-key={group.key}
               className={`workspace-group ${dragTarget?.key === group.key ? (dragTarget.after ? "drop-after" : "drop-before") : ""}`}
             >
-              <div className="group-header-row">
+              {/* A collapsed group hides its rows, so it stands in for the blocked agents inside it. */}
+              <div
+                className="group-header-row"
+                data-blocked={groupCollapsed && blockedCount > 0 ? blockedCount : undefined}
+              >
                 <button
                   type="button"
                   className="group-header"
-                  aria-expanded={!collapsed.includes(group.key)}
+                  aria-expanded={!groupCollapsed}
                   aria-roledescription="드래그 가능한 워크스페이스"
                   title="드래그해서 워크스페이스 순서 변경"
                   onPointerDown={(event) => {
@@ -787,10 +855,7 @@ function App() {
                   }}
                 >
                   <span className="drag-grip" aria-hidden="true">⠿</span>
-                  <span
-                    className={`chevron ${collapsed.includes(group.key) ? "" : "open"}`}
-                    aria-hidden="true"
-                  >
+                  <span className={`chevron ${groupCollapsed ? "" : "open"}`} aria-hidden="true">
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.6" strokeLinecap="round" strokeLinejoin="round">
                       <path d="M9 6l6 6-6 6" />
                     </svg>
@@ -799,6 +864,11 @@ function App() {
                     {stateDot(groupState)}
                   </span>
                   <span className="group-name">{group.label}</span>
+                  {groupCollapsed && blockedCount > 0 && (
+                    <span className="group-blocked" aria-label={`대기 중 ${blockedCount}개`}>
+                      ◉ {blockedCount}
+                    </span>
+                  )}
                   <span className="group-count">{group.sessions.length}</span>
                 </button>
                 <button
@@ -811,13 +881,15 @@ function App() {
                   {group.pinned ? "★" : "☆"}
                 </button>
               </div>
-              {!collapsed.includes(group.key) && (
+              {!groupCollapsed && (
                 <div className="workspace-children">
                   {group.sessions.map((session) => {
                     const ds = asState(session.status);
                     return (
                     <button
                       className={`session-item ${selectedId === session.id ? "selected" : ""}`}
+                      data-state={ds}
+                      data-blocked={ds === "blocked" ? 1 : undefined}
                       key={session.id}
                       title={session.cwd}
                       onClick={() => {
@@ -855,6 +927,7 @@ function App() {
           {!sessions && !connectionError && <div className="sidebar-empty">herdr 세션을 불러오는 중…</div>}
           {sessions?.length === 0 && <div className="sidebar-empty">실행 중인 에이전트가 없습니다.</div>}
         </nav>
+        </div>
 
         <div className="provider-strip">
           {(["claude", "codex", "gemini"] as const).map((provider) => {

@@ -408,9 +408,42 @@ button { color: inherit; }
 .st-green { color: var(--st-green); }
 .st-gray { color: var(--st-gray); }
 .session-meta .agent-glyph { display: inline-block; min-width: 10px; margin-right: 5px; font: 10px/1 ui-monospace, SFMono-Regular, Menlo, Monaco, monospace; text-align: center; }
-.session-meta .state-text { font-weight: 650; opacity: .9; }
-.session-meta .meta-dim { color: var(--faint); }
+.session-meta .state-text { padding: 1px 6px; border-radius: 6px; font-size: 9px; font-weight: 750; letter-spacing: .04em; text-transform: uppercase; }
+.session-meta .state-text.st-red { background: var(--st-red-bg); }
+.session-meta .state-text.st-yellow { background: var(--st-yellow-bg); }
+.session-meta .state-text.st-teal { background: var(--st-teal-bg); }
+.session-meta .state-text.st-green { background: var(--st-green-bg); }
+.session-meta .state-text.st-gray { background: var(--st-gray-bg); }
+.session-meta .meta-dim { margin-left: 5px; color: var(--faint); }
 .group-header .group-dot { flex: 0 0 auto; margin-right: 1px; font: 10px/1 ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+/* blocked waits on the user and done just landed — both earn a colored rail; only blocked, the one
+   that stalls until you act, gets the tint and the pulse. */
+.session-item[data-state]::after { content: ""; position: absolute; top: 8px; bottom: 8px; left: 0; width: 2px; border-radius: 0 2px 2px 0; background: transparent; }
+.session-item[data-state="blocked"]::after { background: var(--st-red); }
+.session-item[data-state="working"]::after { background: var(--st-yellow); }
+.session-item[data-state="done"]::after { background: var(--st-teal); }
+.session-item[data-state="blocked"]:not(.selected) { background: var(--st-red-bg); }
+.session-item[data-state="blocked"] .agent-glyph,
+.group-header .group-dot.st-red,
+.group-header .group-blocked { animation: blocked-pulse 1.5s ease-in-out infinite; }
+@keyframes blocked-pulse { 50% { opacity: .35; } }
+@media (prefers-reduced-motion: reduce) {
+  .session-item[data-state="blocked"] .agent-glyph,
+  .group-header .group-dot.st-red,
+  .group-header .group-blocked { animation: none; }
+}
+
+/* A collapsed group swallows its rows, so it carries their blocked count on the header. */
+.group-header .group-blocked { flex: 0 0 auto; padding: 2px 6px; border-radius: 8px; background: var(--st-red-bg); color: var(--st-red); font-size: 9px; font-weight: 800; white-space: nowrap; }
+
+/* Blocked agents scrolled out of the list get a pill at the edge they're hiding behind. */
+.session-pane { position: relative; flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+.blocked-peek { position: absolute; z-index: 3; left: 50%; transform: translateX(-50%); display: inline-flex; align-items: center; gap: 5px; padding: 5px 11px; border: 1px solid var(--st-red); border-radius: 999px; background: var(--st-red-bg); color: var(--st-red); font-size: 10px; font-weight: 700; white-space: nowrap; cursor: pointer; box-shadow: 0 2px 10px var(--shadow); }
+.blocked-peek.above { top: 3px; }
+.blocked-peek.below { bottom: 7px; }
+.blocked-peek:hover { color: var(--surface); background: var(--st-red); }
+.blocked-peek .peek-arrow { font-size: 7px; }
 .status-pill.st-red { color: var(--st-red); background: var(--st-red-bg); }
 .status-pill.st-yellow { color: var(--st-yellow); background: var(--st-yellow-bg); }
 .status-pill.st-teal { color: var(--st-teal); background: var(--st-teal-bg); }
