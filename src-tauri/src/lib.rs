@@ -64,8 +64,10 @@ struct SessionView {
     updated_at: Option<i64>,
     workspace: Option<String>,
     workspace_id: Option<String>,
-    workspace_number: Option<i64>,
+    workspace_order: Option<i64>,
+    tab_id: Option<String>,
     tab_label: Option<String>,
+    tab_order: Option<i64>,
     display_name: String,
     branch: Option<String>,
 }
@@ -77,6 +79,15 @@ struct TimelineItem {
     ts: Option<String>,
     /// Only set for role="tool" — the UI renders it as the tool card's title.
     tool_name: Option<String>,
+}
+
+/// The transcript's events plus what the agent is running on — the topbar shows model/effort, and
+/// both are only knowable by reading the transcript (herdr's agent JSON carries neither).
+#[derive(Serialize, Clone)]
+struct Timeline {
+    items: Vec<TimelineItem>,
+    model: Option<String>,
+    effort: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -120,7 +131,6 @@ struct HerdrAgent {
 struct HerdrWorkspace {
     workspace_id: String,
     label: String,
-    number: i64,
 }
 
 #[derive(Deserialize)]
@@ -258,7 +268,7 @@ fn read_registry() -> Vec<RegistryEntry> {
 struct HerdrSnapshot {
     agents: Vec<HerdrAgent>,
     workspaces: HashMap<String, (String, i64)>,
-    tabs: HashMap<String, String>,
+    tabs: HashMap<String, (String, i64)>,
 }
 
 fn read_herdr_snapshot() -> HerdrSnapshot {
@@ -280,13 +290,20 @@ fn read_herdr_snapshot() -> HerdrSnapshot {
     let workspaces: Vec<HerdrWorkspace> =
         serde_json::from_value(take("workspaces")).unwrap_or_default();
     let tabs: Vec<HerdrTab> = serde_json::from_value(take("tabs")).unwrap_or_default();
+    // Both arrays come in herdr's own display order; the `number` field is a creation id that
+    // survives reordering, so position — not number — is what herdr shows.
     HerdrSnapshot {
         agents,
         workspaces: workspaces
             .into_iter()
-            .map(|w| (w.workspace_id, (w.label, w.number)))
+            .enumerate()
+            .map(|(i, w)| (w.workspace_id, (w.label, i as i64)))
             .collect(),
-        tabs: tabs.into_iter().map(|t| (t.tab_id, t.label)).collect(),
+        tabs: tabs
+            .into_iter()
+            .enumerate()
+            .map(|(i, t)| (t.tab_id, (t.label, i as i64)))
+            .collect(),
     }
 }
 
@@ -381,18 +398,171 @@ fn find_transcript(session_id: &str) -> Option<String> {
     best.map(|(_, p)| p)
 }
 
+/// Scans ~/.codex/sessions/**/rollout-*.jsonl and returns the most recently modified file whose
+/// recorded session cwd matches. Codex panes carry no session id, so cwd + recency is the join key.
+fn find_codex_transcript(cwd: &str) -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let root = PathBuf::from(&home).join(".codex/sessions");
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    collect_rollout_files(&root, 0, &mut files);
+    files.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, path) in files.into_iter().take(60) {
+        if codex_session_cwd(&path).as_deref() == Some(cwd) {
+            return Some(path.to_string_lossy().to_string());
+        }
+    }
+    None
+}
+
+fn collect_rollout_files(
+    dir: &std::path::Path,
+    depth: u8,
+    out: &mut Vec<(std::time::SystemTime, PathBuf)>,
+) {
+    if depth > 6 {
+        return;
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rollout_files(&path, depth + 1, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl")
+            && path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with("rollout-"))
+                .unwrap_or(false)
+        {
+            let mtime = std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            out.push((mtime, path));
+        }
+    }
+}
+
+/// Reads the recorded working directory from a codex rollout's session-meta line (near the top).
+fn codex_session_cwd(path: &std::path::Path) -> Option<String> {
+    use std::io::{BufRead, BufReader};
+    let file = std::fs::File::open(path).ok()?;
+    for line in BufReader::new(file).lines().take(8).flatten() {
+        let v: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        for cwd in [
+            v.pointer("/payload/cwd"),
+            v.pointer("/payload/session/cwd"),
+            v.get("cwd"),
+            v.pointer("/meta/cwd"),
+        ] {
+            if let Some(s) = cwd.and_then(Value::as_str) {
+                return Some(s.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Gemini CLI stores per-project chats under ~/.gemini/tmp/<project-name>/, where the folder is the
+/// project directory's basename, slugified (lowercased, non-alphanumerics → '-'). We resolve that
+/// folder and pick its conversation JSON (chats / checkpoint / logs.json), most complete then most
+/// recent winning.
+fn find_gemini_transcript(cwd: &str) -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let base = cwd.rsplit('/').find(|s| !s.is_empty())?.to_string();
+    let slug: String = base
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let tmp = PathBuf::from(&home).join(".gemini/tmp");
+    let mut best: Option<(u8, std::time::SystemTime, u64, String)> = None;
+    for name in [base, slug] {
+        gemini_scan_dir(&tmp.join(&name), &mut best);
+        if best.is_some() {
+            break;
+        }
+    }
+    best.map(|(_, _, _, p)| p)
+}
+
+/// Keeps the best conversation file inside a gemini project temp dir: newest wins, and on a tie the
+/// larger file wins. Resuming a session leaves behind same-mtime stub chat files holding nothing but
+/// the session_context preamble — without the size tiebreak a stub can beat the live conversation.
+fn gemini_scan_dir(
+    dir: &std::path::Path,
+    best: &mut Option<(u8, std::time::SystemTime, u64, String)>,
+) {
+    let mut stack = vec![dir.to_path_buf()];
+    let mut guard = 0;
+    while let Some(current) = stack.pop() {
+        guard += 1;
+        if guard > 128 {
+            break;
+        }
+        let entries = match std::fs::read_dir(&current) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            // Recent Gemini CLI writes chats as .jsonl; older builds used .json.
+            let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if extension != "json" && extension != "jsonl" {
+                continue;
+            }
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let rank: u8 = if name.contains("checkpoint") || path.to_string_lossy().contains("/chats/")
+            {
+                3
+            } else if name == "logs.json" {
+                2
+            } else if name.contains("chat") || name.contains("session") {
+                1
+            } else {
+                0
+            };
+            let meta = std::fs::metadata(&path).ok();
+            let mtime = meta
+                .as_ref()
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            let size = meta.map(|m| m.len()).unwrap_or(0);
+            let candidate = path.to_string_lossy().to_string();
+            let better = match best {
+                None => true,
+                Some((br, bm, bs, _)) => (rank, mtime, size) > (*br, *bm, *bs),
+            };
+            if better {
+                *best = Some((rank, mtime, size, candidate));
+            }
+        }
+    }
+}
+
 /// Looks up a herdr agent's workspace label/number and tab label from the id maps built
 /// from `herdr workspace list` / `herdr tab list`.
 fn herdr_workspace_fields(
     h: &HerdrAgent,
     workspaces: &HashMap<String, (String, i64)>,
-    tabs: &HashMap<String, String>,
-) -> (Option<String>, Option<i64>, Option<String>) {
+    tabs: &HashMap<String, (String, i64)>,
+) -> (Option<String>, Option<i64>, Option<String>, Option<i64>) {
     let workspace_entry = h.workspace_id.as_deref().and_then(|id| workspaces.get(id));
     let workspace_label = workspace_entry.map(|(l, _)| l.clone());
-    let workspace_number = workspace_entry.map(|(_, n)| *n);
-    let tab_label = h.tab_id.as_deref().and_then(|id| tabs.get(id)).cloned();
-    (workspace_label, workspace_number, tab_label)
+    let workspace_order = workspace_entry.map(|(_, n)| *n);
+    let tab_entry = h.tab_id.as_deref().and_then(|id| tabs.get(id));
+    let tab_label = tab_entry.map(|(l, _)| l.clone());
+    let tab_order = tab_entry.map(|(_, n)| *n);
+    (workspace_label, workspace_order, tab_label, tab_order)
 }
 
 /// Merges registry sessions and herdr agents into the SessionView contract.
@@ -403,7 +573,7 @@ fn build_sessions(
     registry: Vec<RegistryEntry>,
     herdr: Vec<HerdrAgent>,
     workspaces: &HashMap<String, (String, i64)>,
-    tabs: &HashMap<String, String>,
+    tabs: &HashMap<String, (String, i64)>,
     fpgids: &HashMap<String, i32>,
 ) -> Vec<SessionView> {
     let mut herdr_by_pid: HashMap<i32, &HerdrAgent> = HashMap::new();
@@ -419,7 +589,7 @@ fn build_sessions(
     for r in &registry {
         if let Some(h) = herdr_by_pid.get(&r.pid).copied() {
             matched_panes.insert(h.pane_id.as_str());
-            let (workspace, workspace_number, tab_label) =
+            let (workspace, workspace_order, tab_label, tab_order) =
                 herdr_workspace_fields(h, workspaces, tabs);
             out.push(SessionView {
                 id: r.session_id.clone(),
@@ -441,8 +611,10 @@ fn build_sessions(
                 ),
                 workspace,
                 workspace_id: h.workspace_id.clone(),
-                workspace_number,
+                workspace_order,
+                tab_id: h.tab_id.clone(),
                 tab_label,
+                tab_order,
                 branch: git_branch(&r.cwd),
             });
         } else {
@@ -461,8 +633,10 @@ fn build_sessions(
                 display_name: resolve_display_name(None, None, r.name.as_deref(), &r.cwd),
                 workspace: None,
                 workspace_id: None,
-                workspace_number: None,
+                workspace_order: None,
+                tab_id: None,
                 tab_label: None,
+                tab_order: None,
                 branch: git_branch(&r.cwd),
             });
         }
@@ -472,7 +646,8 @@ fn build_sessions(
         if matched_panes.contains(h.pane_id.as_str()) {
             continue;
         }
-        let (workspace, workspace_number, tab_label) = herdr_workspace_fields(h, workspaces, tabs);
+        let (workspace, workspace_order, tab_label, tab_order) =
+            herdr_workspace_fields(h, workspaces, tabs);
         out.push(SessionView {
             id: h.pane_id.clone(),
             session_id: None,
@@ -483,7 +658,11 @@ fn build_sessions(
             source: "herdr".to_string(),
             pane_id: Some(h.pane_id.clone()),
             pid: None,
-            transcript_path: None,
+            transcript_path: match h.agent.as_str() {
+                "codex" => find_codex_transcript(&h.cwd),
+                "gemini" => find_gemini_transcript(&h.cwd),
+                _ => None,
+            },
             updated_at: None,
             display_name: resolve_display_name(
                 workspace.as_deref(),
@@ -493,8 +672,10 @@ fn build_sessions(
             ),
             workspace,
             workspace_id: h.workspace_id.clone(),
-            workspace_number,
+            workspace_order,
+            tab_id: h.tab_id.clone(),
             tab_label,
+            tab_order,
             branch: git_branch(&h.cwd),
         });
     }
@@ -525,9 +706,10 @@ const MAX_TRANSCRIPT_BYTES: u64 = 768 * 1024;
 fn validate_transcript_path_with_root(
     path: &std::path::Path,
     root: &std::path::Path,
+    ext: &str,
 ) -> Result<PathBuf, String> {
-    if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
-        return Err("Claude transcript JSONL 파일만 읽을 수 있습니다".to_string());
+    if path.extension().and_then(|value| value.to_str()) != Some(ext) {
+        return Err("트랜스크립트 파일 형식이 올바르지 않습니다".to_string());
     }
     let root = std::fs::canonicalize(root)
         .map_err(|_| "Claude projects 경로를 찾을 수 없습니다".to_string())?;
@@ -539,10 +721,25 @@ fn validate_transcript_path_with_root(
     Ok(path)
 }
 
-fn validated_transcript_path(path: &str) -> Result<PathBuf, String> {
+/// Validates a transcript path against the allowed roots and returns (canonical path, format).
+/// Claude/Codex use JSONL; Gemini uses .json (older CLI) or .jsonl (current) — both listed.
+fn validated_transcript(path: &str) -> Result<(PathBuf, &'static str), String> {
     let home = std::env::var("HOME").map_err(|_| "HOME 경로를 찾을 수 없습니다".to_string())?;
-    let root = PathBuf::from(home).join(".claude/projects");
-    validate_transcript_path_with_root(std::path::Path::new(path), &root)
+    let roots: [(&str, &str, &str); 4] = [
+        (".claude/projects", "jsonl", "claude"),
+        (".codex/sessions", "jsonl", "codex"),
+        (".gemini/tmp", "json", "gemini"),
+        (".gemini/tmp", "jsonl", "gemini"),
+    ];
+    let mut last_err = "허용되지 않은 트랜스크립트 경로입니다".to_string();
+    for (rel, ext, format) in roots {
+        let root = PathBuf::from(&home).join(rel);
+        match validate_transcript_path_with_root(std::path::Path::new(path), &root, ext) {
+            Ok(canonical) => return Ok((canonical, format)),
+            Err(e) => last_err = e,
+        }
+    }
+    Err(last_err)
 }
 
 fn truncate(value: &str, limit: usize) -> String {
@@ -570,6 +767,7 @@ fn ignored_user_text(text: &str) -> bool {
     trimmed.starts_with("<system-reminder")
         || trimmed.starts_with("<local-command")
         || trimmed.starts_with("<ide_")
+        || trimmed.starts_with("<session_context")
 }
 
 fn between<'a>(value: &'a str, start: &str, end: &str) -> Option<&'a str> {
@@ -678,6 +876,223 @@ fn parse_line(line: &str) -> Vec<TimelineItem> {
     items
 }
 
+/// Concatenates the text blocks of a codex `message` item's content array.
+fn codex_content_text(content: Option<&Value>) -> String {
+    let arr = match content.and_then(Value::as_array) {
+        Some(a) => a,
+        None => return content.and_then(Value::as_str).unwrap_or("").to_string(),
+    };
+    let mut out = String::new();
+    for block in arr {
+        let block_type = block.get("type").and_then(Value::as_str).unwrap_or("");
+        if matches!(block_type, "input_text" | "output_text" | "text" | "") {
+            if let Some(s) = block.get("text").and_then(Value::as_str) {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(s);
+            }
+        }
+    }
+    out
+}
+
+/// Summarizes a codex function_call's arguments (a JSON string) to its most identifying value.
+fn codex_tool_text(args: &str) -> String {
+    if let Ok(v) = serde_json::from_str::<Value>(args) {
+        for key in ["command", "cmd", "file_path", "path", "query", "pattern", "url"] {
+            if let Some(s) = v.get(key).and_then(Value::as_str) {
+                return truncate(s, 360);
+            }
+        }
+        if let Some(arr) = v.get("command").and_then(Value::as_array) {
+            let joined = arr
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" ");
+            if !joined.is_empty() {
+                return truncate(&joined, 360);
+            }
+        }
+    }
+    truncate(args, 360)
+}
+
+/// Parses a codex rollout JSONL line into timeline items. Defensive: handles both the
+/// response_item (message/function_call) and event_msg (agent_message/user_message) shapes,
+/// wrapped under "payload" or not, and skips anything else.
+fn parse_codex_line(line: &str) -> Vec<TimelineItem> {
+    let line = line.trim();
+    if line.is_empty() {
+        return Vec::new();
+    }
+    let v: Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let ts = v
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let inner = v.get("payload").unwrap_or(&v);
+    let kind = inner.get("type").and_then(Value::as_str).unwrap_or("");
+    let mut items = Vec::new();
+    match kind {
+        "message" => {
+            let role = inner.get("role").and_then(Value::as_str).unwrap_or("");
+            let text = codex_content_text(inner.get("content"));
+            if !text.is_empty() && (role == "user" || role == "assistant") {
+                if role == "user" && ignored_user_text(&text) {
+                    return items;
+                }
+                items.push(TimelineItem {
+                    role: role.to_string(),
+                    text: truncate(&text, 12_000),
+                    ts,
+                    tool_name: None,
+                });
+            }
+        }
+        "function_call" => {
+            let name = inner.get("name").and_then(Value::as_str).unwrap_or("tool");
+            let args = inner.get("arguments").and_then(Value::as_str).unwrap_or("");
+            items.push(TimelineItem {
+                role: "tool".to_string(),
+                text: codex_tool_text(args),
+                ts,
+                tool_name: Some(name.to_string()),
+            });
+        }
+        "agent_message" => {
+            if let Some(t) = inner.get("message").and_then(Value::as_str) {
+                if !t.is_empty() {
+                    items.push(TimelineItem {
+                        role: "assistant".to_string(),
+                        text: truncate(t, 12_000),
+                        ts,
+                        tool_name: None,
+                    });
+                }
+            }
+        }
+        "user_message" => {
+            if let Some(t) = inner.get("message").and_then(Value::as_str) {
+                if !t.is_empty() && !ignored_user_text(t) {
+                    items.push(TimelineItem {
+                        role: "user".to_string(),
+                        text: truncate(t, 8_000),
+                        ts,
+                        tool_name: None,
+                    });
+                }
+            }
+        }
+        _ => {}
+    }
+    items
+}
+
+/// The messages of a gemini conversation file, in order. Three on-disk shapes:
+///   - logs.json — a bare array of {type, message} (user prompts only)
+///   - chats/*.json (older CLI) — one document, {messages: [...]}
+///   - chats/*.jsonl (current CLI) — an op log: a bare object appends one message,
+///     {"$set": {"messages": [...]}} replaces the whole array. Replaying both in file order
+///     lands on the final state.
+fn gemini_messages(content: &str) -> Vec<Value> {
+    if let Ok(v) = serde_json::from_str::<Value>(content) {
+        if let Some(arr) = v.as_array() {
+            return arr.clone();
+        }
+        if let Some(arr) = v.get("messages").and_then(Value::as_array) {
+            return arr.clone();
+        }
+        return Vec::new();
+    }
+    let mut messages: Vec<Value> = Vec::new();
+    for line in content.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if let Some(set) = v.get("$set") {
+            if let Some(arr) = set.get("messages").and_then(Value::as_array) {
+                messages = arr.clone();
+            }
+        } else if v.get("type").is_some() {
+            messages.push(v);
+        }
+    }
+    messages
+}
+
+/// Message text, minus the model's internal monologue: gemini splits `content` into parts and marks
+/// reasoning ones `thought: true` — keeping those would show thinking instead of the answer.
+fn gemini_text(message: &Value) -> String {
+    if let Some(s) = message.get("message").and_then(Value::as_str) {
+        return s.to_string();
+    }
+    let content = message.get("content").unwrap_or(&Value::Null);
+    if let Some(s) = content.as_str() {
+        return s.to_string();
+    }
+    let Some(parts) = content.as_array() else {
+        return String::new();
+    };
+    parts
+        .iter()
+        .filter(|p| p.get("thought") != Some(&Value::Bool(true)))
+        .filter_map(|p| p.get("text").and_then(Value::as_str))
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Parses a gemini conversation file into timeline items. A message is {type, content, toolCalls},
+/// where type is "user" | "gemini" (plus "info"/"error" chatter we drop), and a user turn carrying
+/// only functionResponse parts is a tool result, not something the user said.
+fn parse_gemini(content: &str) -> Vec<TimelineItem> {
+    let mut items = Vec::new();
+    for message in gemini_messages(content) {
+        let role = match message.get("type").and_then(Value::as_str) {
+            Some("user") => "user",
+            Some("gemini") | Some("assistant") | Some("model") => "assistant",
+            _ => continue,
+        };
+        let text = gemini_text(&message);
+        let ts = message
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let hidden = text.is_empty() || (role == "user" && ignored_user_text(&text));
+        if !hidden {
+            items.push(TimelineItem {
+                role: role.to_string(),
+                text: truncate(&text, 12_000),
+                ts: ts.clone(),
+                tool_name: None,
+            });
+        }
+        for call in message
+            .get("toolCalls")
+            .and_then(Value::as_array)
+            .unwrap_or(&Vec::new())
+        {
+            let name = call.get("name").and_then(Value::as_str).unwrap_or("tool");
+            let args = call
+                .get("args")
+                .map(|a| serde_json::to_string(a).unwrap_or_default())
+                .unwrap_or_default();
+            items.push(TimelineItem {
+                role: "tool".to_string(),
+                text: truncate(&args, 360),
+                ts: ts.clone(),
+                tool_name: Some(name.to_string()),
+            });
+        }
+    }
+    items
+}
+
 /// Reads at most the last MAX_TRANSCRIPT_BYTES, dropping the first (likely truncated) line.
 fn read_tail(path: &str) -> Result<String, String> {
     use std::io::{Read, Seek, SeekFrom};
@@ -697,21 +1112,75 @@ fn read_tail(path: &str) -> Result<String, String> {
     Ok(text)
 }
 
+/// Claude stamps the model on every assistant line, so the last one is what the session runs on
+/// now — `/model` mid-session simply changes the lines after it. `<synthetic>` marks Claude Code's
+/// own error messages, not a model.
+fn claude_model(text: &str) -> Option<String> {
+    text.lines().rev().find_map(|line| {
+        let value: Value = serde_json::from_str(line).ok()?;
+        match value["message"]["model"].as_str() {
+            Some("<synthetic>") | None => None,
+            Some(model) => Some(model.to_string()),
+        }
+    })
+}
+
+/// Codex re-emits a `turn_context` line every turn; the last one carries the model and reasoning
+/// effort in force right now.
+fn codex_model(text: &str) -> (Option<String>, Option<String>) {
+    for line in text.lines().rev() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if value["type"] != "turn_context" {
+            continue;
+        }
+        let payload = &value["payload"];
+        return (
+            payload["model"].as_str().map(str::to_string),
+            payload["effort"].as_str().map(str::to_string),
+        );
+    }
+    (None, None)
+}
+
 #[tauri::command]
-fn get_timeline(transcript_path: String, last: usize) -> Result<Vec<TimelineItem>, String> {
-    let transcript_path = validated_transcript_path(&transcript_path)?;
-    let content = read_tail(&transcript_path.to_string_lossy())?;
-    let mut items: Vec<TimelineItem> = content.lines().flat_map(parse_line).collect();
+fn get_timeline(transcript_path: String, last: usize) -> Result<Timeline, String> {
+    let (path, format) = validated_transcript(&transcript_path)?;
+    let path_str = path.to_string_lossy().to_string();
+    // Model/effort come out of the same bytes the timeline is parsed from, so they stay in sync
+    // with a mid-session /model without a second read. Gemini's log records neither.
+    let (mut items, model, effort) = match format {
+        "gemini" => {
+            let content = std::fs::read_to_string(&path_str).map_err(|e| e.to_string())?;
+            (parse_gemini(&content), None, None)
+        }
+        "codex" => {
+            let text = read_tail(&path_str)?;
+            let items = text.lines().flat_map(parse_codex_line).collect();
+            let (model, effort) = codex_model(&text);
+            (items, model, effort)
+        }
+        _ => {
+            let text = read_tail(&path_str)?;
+            let items = text.lines().flat_map(parse_line).collect();
+            (items, claude_model(&text), None)
+        }
+    };
     let start = items.len().saturating_sub(last);
     items = items.split_off(start);
-    Ok(items)
+    Ok(Timeline {
+        items,
+        model,
+        effort,
+    })
 }
 
 /// Transcript mtime in epoch millis (0 if missing) — a cheap change check so the UI can
 /// poll this instead of re-parsing the whole transcript every second.
 #[tauri::command]
 fn get_timeline_revision(transcript_path: String) -> Result<i64, String> {
-    let transcript_path = validated_transcript_path(&transcript_path)?;
+    let (transcript_path, _) = validated_transcript(&transcript_path)?;
     Ok(std::fs::metadata(&transcript_path)
         .and_then(|m| m.modified())
         .ok()
@@ -782,11 +1251,13 @@ fn validate_pane_id(pane_id: &str) -> Result<(), String> {
     if workspace_part.is_empty() || !workspace_part.chars().all(|c| c.is_ascii_alphanumeric()) {
         return Err("잘못된 pane id".to_string());
     }
-    let digits = match pane_part.strip_prefix('p') {
+    let pane_num = match pane_part.strip_prefix('p') {
         Some(d) => d,
         None => return Err("잘못된 pane id".to_string()),
     };
-    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+    // herdr numbers panes in base36-ish ids (e.g. "wA:pA"), so allow alphanumerics — still no
+    // shell-dangerous chars, spaces, or leading dashes, which is what this trust check guards.
+    if pane_num.is_empty() || !pane_num.chars().all(|c| c.is_ascii_alphanumeric()) {
         return Err("잘못된 pane id".to_string());
     }
     Ok(())
@@ -976,6 +1447,34 @@ mod tests {
     }
 
     #[test]
+    fn claude_model_takes_the_last_real_model() {
+        let text = [
+            r#"{"type":"assistant","message":{"model":"claude-sonnet-5","role":"assistant"}}"#,
+            r#"{"type":"assistant","message":{"model":"claude-opus-4-8","role":"assistant"}}"#,
+            // Claude Code's own error lines are stamped <synthetic> — not a model.
+            r#"{"type":"assistant","message":{"model":"<synthetic>","role":"assistant"}}"#,
+            r#"{"type":"user","message":{"role":"user","content":"hi"}}"#,
+        ]
+        .join("\n");
+        assert_eq!(claude_model(&text).as_deref(), Some("claude-opus-4-8"));
+        assert_eq!(claude_model(r#"{"type":"user"}"#), None);
+    }
+
+    #[test]
+    fn codex_model_takes_the_last_turn_context() {
+        let text = [
+            r#"{"type":"turn_context","payload":{"model":"gpt-5.6","effort":"low"}}"#,
+            r#"{"type":"turn_context","payload":{"model":"gpt-5.6-sol","effort":"medium"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+        ]
+        .join("\n");
+        let (model, effort) = codex_model(&text);
+        assert_eq!(model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(effort.as_deref(), Some("medium"));
+        assert_eq!(codex_model(r#"{"type":"event_msg"}"#), (None, None));
+    }
+
+    #[test]
     fn get_timeline_respects_last_n() {
         let lines = (0..5)
             .map(|i| {
@@ -995,6 +1494,7 @@ mod tests {
     #[test]
     fn validates_pane_id_format() {
         assert!(validate_pane_id("wA:p3").is_ok());
+        assert!(validate_pane_id("wA:pA").is_ok());
         assert!(validate_pane_id("w9:p12").is_ok());
         assert!(validate_pane_id("wAbc123:p0").is_ok());
     }
@@ -1005,7 +1505,6 @@ mod tests {
             "p3",
             "wA:p",
             "wA:3",
-            "wA:pX",
             "wA:p3:extra",
             "wA",
             ":p3",
@@ -1038,11 +1537,11 @@ mod tests {
         std::fs::write(&wrong_extension, "{}\n").unwrap();
 
         assert_eq!(
-            validate_transcript_path_with_root(&inside, &root).unwrap(),
+            validate_transcript_path_with_root(&inside, &root, "jsonl").unwrap(),
             std::fs::canonicalize(&inside).unwrap()
         );
-        assert!(validate_transcript_path_with_root(&outside, &root).is_err());
-        assert!(validate_transcript_path_with_root(&wrong_extension, &root).is_err());
+        assert!(validate_transcript_path_with_root(&outside, &root, "jsonl").is_err());
+        assert!(validate_transcript_path_with_root(&wrong_extension, &root, "jsonl").is_err());
 
         std::fs::remove_dir_all(&base).ok();
     }
@@ -1140,6 +1639,72 @@ mod tests {
         let items: Vec<TimelineItem> = text.lines().flat_map(parse_line).collect();
         assert_eq!(items.last().unwrap().text, "마지막");
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn parses_gemini_jsonl_op_log() {
+        // 현재 Gemini CLI 포맷: 헤더 + 메시지 append + {"$set":{"messages":[...]}} 전체 교체
+        let content = concat!(
+            r#"{"sessionId":"c20","startTime":"2026-07-13T09:50:32.971Z","kind":"main"}"#,
+            "\n",
+            r#"{"id":"m0","timestamp":"2026-07-13T09:51:00.000Z","type":"info","content":"Gemini CLI update available!"}"#,
+            "\n",
+            r#"{"$set":{"messages":[{"id":"m1","timestamp":"2026-07-13T09:52:00.000Z","type":"user","content":[{"text":"<session_context>\nThis is the Gemini CLI."}]},{"id":"m2","timestamp":"2026-07-13T09:53:00.000Z","type":"user","content":[{"text":"이 프로젝트를 보고 이름을 뭐로 할지 고민좀"}]},{"id":"m3","timestamp":"2026-07-13T09:54:00.000Z","type":"user","content":[{"functionResponse":{"name":"read_file"}}]},{"id":"m4","timestamp":"2026-07-13T09:55:00.000Z","type":"gemini","content":[{"text":"**Considering Project Identity** I'm currently...","thought":true},{"text":"이름은 HerdDeck 을 추천합니다."}],"toolCalls":[{"name":"read_file","args":{"path":"src/lib.rs"}}]}]}}"#
+        );
+
+        let items = parse_gemini(content);
+
+        // 사용자 프롬프트 1 + 모델 답변 1 + 툴 1 — info/session_context/functionResponse-only 는 제외
+        let said: Vec<_> = items.iter().filter(|i| i.role != "tool").collect();
+        assert_eq!(said.len(), 2, "대화가 비어있음: {items:?}");
+        assert_eq!(said[0].role, "user");
+        assert_eq!(said[0].text, "이 프로젝트를 보고 이름을 뭐로 할지 고민좀");
+        assert_eq!(said[1].role, "assistant");
+        // thought 파트가 아니라 실제 답변이 나와야 함
+        assert_eq!(said[1].text, "이름은 HerdDeck 을 추천합니다.");
+        assert_eq!(
+            items.iter().filter(|i| i.role == "tool").count(),
+            1,
+            "toolCalls 누락"
+        );
+    }
+
+    #[test]
+    fn parses_gemini_legacy_json_document() {
+        // 구버전 CLI: chats/*.json 단일 문서, gemini content 가 문자열
+        let content = r#"{"sessionId":"56e","messages":[
+            {"id":"1","timestamp":"2026-02-26T04:15:00.000Z","type":"user","content":[{"text":"두 API 구현 차이 있나"}]},
+            {"id":"2","timestamp":"2026-02-26T04:16:00.000Z","type":"gemini","content":"추상화 계층부터 확인하겠습니다."}
+        ]}"#;
+
+        let items = parse_gemini(content);
+
+        assert_eq!(items.len(), 2, "구포맷이 깨짐: {items:?}");
+        assert_eq!(items[0].role, "user");
+        assert_eq!(items[1].role, "assistant");
+        assert_eq!(items[1].text, "추상화 계층부터 확인하겠습니다.");
+    }
+
+    #[test]
+    fn gemini_scan_prefers_live_chat_over_same_mtime_stub() {
+        // 세션 재개가 남긴 스텁은 실제 대화 파일과 mtime 이 같다 — 크기로 갈라야 한다
+        let dir = std::env::temp_dir().join("herddeck-gemini-scan-test/chats");
+        std::fs::create_dir_all(&dir).unwrap();
+        let live = dir.join("session-2026-07-13T09-50-c20bbcd8.jsonl");
+        let stub = dir.join("session-2026-07-13T12-30-c20bbcd8.jsonl");
+        std::fs::write(&live, "x".repeat(200_000)).unwrap();
+        std::fs::write(&stub, "x".repeat(2_909)).unwrap();
+        let mtime = std::fs::metadata(&live).unwrap().modified().unwrap();
+        for path in [&live, &stub] {
+            let file = std::fs::File::options().write(true).open(path).unwrap();
+            file.set_modified(mtime).unwrap();
+        }
+
+        let mut best = None;
+        gemini_scan_dir(dir.parent().unwrap(), &mut best);
+
+        assert_eq!(best.map(|(_, _, _, p)| p), Some(live.to_string_lossy().to_string()));
+        std::fs::remove_dir_all(dir.parent().unwrap()).ok();
     }
 
     #[test]

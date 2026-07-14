@@ -22,8 +22,10 @@ interface SessionView {
   updated_at: number | null;
   workspace: string | null;
   workspace_id: string | null;
-  workspace_number: number | null;
+  workspace_order: number | null;
+  tab_id: string | null;
   tab_label: string | null;
+  tab_order: number | null;
   display_name: string;
   branch: string | null;
 }
@@ -33,6 +35,14 @@ interface TimelineItem {
   text: string;
   ts: string | null;
   tool_name: string | null;
+}
+
+/** Model/effort ride along with the transcript because that's the only place they're recorded —
+ *  and only where the CLI writes them: Claude logs no effort, Gemini logs neither. */
+interface Timeline {
+  items: TimelineItem[];
+  model: string | null;
+  effort: string | null;
 }
 
 interface ProviderInstallation {
@@ -71,6 +81,72 @@ function ProviderLogo({ provider }: { provider: string }) {
   const src = providerLogos[provider];
   if (src) return <img className="provider-logo" src={src} alt="" />;
   return <>{providerMarks[provider] ?? providerMarks.other}</>;
+}
+
+type SpaceTab = { key: string; label: string; number: number; sessionId: string; count: number };
+
+/** A session's key in the tab strip: its herdr tab, or itself when herdr knows no tab for it.
+ *  Keyed by tab_id, not by label — herdr labels repeat ("1", "2") across tabs. */
+function tabKeyOf(session: SessionView) {
+  return session.tab_id ?? `__${session.id}`;
+}
+
+/** The tabs of a session's space in herdr's own tab order (tab_order), one entry per tab,
+ *  carrying a representative session to switch to and how many panes it holds. */
+function spaceTabsOf(sessions: SessionView[], selected: SessionView): SpaceTab[] {
+  if (!selected.workspace_id) return [];
+  const byTab = new Map<string, SpaceTab>();
+  for (const session of sessions) {
+    if (session.workspace_id !== selected.workspace_id) continue;
+    const key = tabKeyOf(session);
+    const entry = byTab.get(key);
+    if (entry) entry.count += 1;
+    else
+      byTab.set(key, {
+        key,
+        label: session.tab_label ?? "탭",
+        number: session.tab_order ?? Number.MAX_SAFE_INTEGER,
+        sessionId: session.id,
+        count: 1,
+      });
+  }
+  return [...byTab.values()].sort((a, b) => a.number - b.number);
+}
+
+/** herdr shows a workspace's tabs as a strip along the top; we do the same, but only when a
+ *  space actually has more than one tab. Clicking a tab jumps to a session inside it. */
+function SpaceTabs({
+  sessions,
+  selected,
+  onSelect,
+}: {
+  sessions: SessionView[];
+  selected: SessionView;
+  onSelect: (id: string) => void;
+}) {
+  const tabs = spaceTabsOf(sessions, selected);
+  if (tabs.length < 2) return null;
+  const activeKey = tabKeyOf(selected);
+  return (
+    <div className="space-tabs" role="tablist" aria-label={`${selected.workspace ?? "space"} 탭`}>
+      {tabs.map((tab) => {
+        const active = tab.key === activeKey;
+        return (
+          <button
+            key={tab.key}
+            type="button"
+            role="tab"
+            aria-selected={active}
+            className={`space-tab ${active ? "active" : ""}`}
+            onClick={() => onSelect(tab.sessionId)}
+          >
+            <span className="space-tab-label">{tab.label}</span>
+            {tab.count > 1 && <span className="space-tab-count">{tab.count}</span>}
+          </button>
+        );
+      })}
+    </div>
+  );
 }
 
 // herdr's status vocabulary, ported 1:1 from src/ui/status.rs. The backend now passes herdr's
@@ -190,11 +266,17 @@ function groupSessions(sessions: SessionView[], pinned: string[], workspaceOrder
     if (!groups.has(key)) {
       groups.set(key, {
         label: session.workspace ?? "기타",
-        order: session.workspace_number ?? Number.MAX_SAFE_INTEGER,
+        order: session.workspace_order ?? Number.MAX_SAFE_INTEGER,
         sessions: [],
       });
     }
     groups.get(key)!.sessions.push(session);
+  }
+  // Inside a group, follow herdr's tab order; panes of the same tab keep backend order (stable sort).
+  for (const group of groups.values()) {
+    group.sessions.sort(
+      (a, b) => (a.tab_order ?? Number.MAX_SAFE_INTEGER) - (b.tab_order ?? Number.MAX_SAFE_INTEGER),
+    );
   }
   return [...groups.entries()]
     .map(([key, group]) => ({ key, ...group, pinned: pinned.includes(key) }))
@@ -295,7 +377,7 @@ function App() {
   const [outputError, setOutputError] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
   const [socketConnected, setSocketConnected] = useState<boolean | null>(null);
-  const [timeline, setTimeline] = useState<TimelineItem[] | null>(null);
+  const [timeline, setTimeline] = useState<Timeline | null>(null);
   const [viewMode, setViewMode] = useState<"chat" | "terminal">("chat");
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [pinned, togglePinned, updatePinned] = useStoredKeys("rl.pinnedWorkspaces");
@@ -309,6 +391,8 @@ function App() {
   });
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [spinnerTick, setSpinnerTick] = useState(0);
+  const [listScrolling, setListScrolling] = useState(false);
+  const scrollIdleTimer = useRef<number | null>(null);
   const fleetRefreshTimer = useRef<number | null>(null);
   const fleetRequestRef = useRef(0);
   const revisionRef = useRef<number>(0);
@@ -320,6 +404,13 @@ function App() {
   selectedIdRef.current = selectedId;
 
   const message = selectedId ? drafts[selectedId] ?? "" : "";
+
+  // The dot carries the state now, so the wording it replaced lives on as its tooltip and label.
+  const herdrStatus = connectionError
+    ? { tone: "bad", label: "herdr 연결 끊김" }
+    : socketConnected
+      ? { tone: "live", label: "herdr · 실시간" }
+      : { tone: "polling", label: "herdr · 폴링 모드" };
 
   // Theme lives on <html data-theme> so every CSS token flips at once; persisted per machine.
   useLayoutEffect(() => {
@@ -441,7 +532,7 @@ function App() {
       return;
     }
     try {
-      const next = await invoke<TimelineItem[]>("get_timeline", { transcriptPath: path, last: 200 });
+      const next = await invoke<Timeline>("get_timeline", { transcriptPath: path, last: 200 });
       if (selectedIdRef.current !== sessionId) return;
       setTimeline(next);
     } catch {
@@ -600,17 +691,10 @@ function App() {
     <div className="app-shell">
       <aside className={`sidebar ${mobileSidebarOpen ? "mobile-open" : ""}`}>
         <div className="brand-row">
-          <div className="brand-mark">H</div>
-          <div>
-            <strong>HerdDeck</strong>
-            <span className={connectionError ? "connection-bad" : "connection-good"}>
-              {connectionError
-                ? "herdr 연결 끊김"
-                : socketConnected
-                  ? "herdr · 실시간"
-                  : "herdr · 폴링 모드"}
-            </span>
-          </div>
+          <span className="herdr-status" title={herdrStatus.label}>
+            herdr
+            <i className={herdrStatus.tone} role="img" aria-label={herdrStatus.label} />
+          </span>
           <button className="icon-button" aria-label="새로고침" onClick={() => void refreshFleet()}>↻</button>
           <button
             type="button"
@@ -628,7 +712,17 @@ function App() {
 
         {/* Settings render as a modal at the app root (see below). */}
 
-        <nav className="session-list" aria-label="에이전트 세션">
+        {/* Styling a WebKit scrollbar at all costs it the OS overlay behavior, so the
+            "only while scrolling" fade is driven here instead. */}
+        <nav
+          className={`session-list ${listScrolling ? "scrolling" : ""}`}
+          aria-label="에이전트 세션"
+          onScroll={() => {
+            setListScrolling(true);
+            if (scrollIdleTimer.current !== null) window.clearTimeout(scrollIdleTimer.current);
+            scrollIdleTimer.current = window.setTimeout(() => setListScrolling(false), 700);
+          }}
+        >
           {groups.map((group) => {
             const groupState = rollUpState(group.sessions.map((session) => asState(session.status)));
             return (
@@ -693,9 +787,13 @@ function App() {
                   }}
                 >
                   <span className="drag-grip" aria-hidden="true">⠿</span>
-                  <span className="workspace-icon" aria-hidden="true" />
-                  <span className="chevron" aria-hidden="true">
-                    {collapsed.includes(group.key) ? "▸" : "▾"}
+                  <span
+                    className={`chevron ${collapsed.includes(group.key) ? "" : "open"}`}
+                    aria-hidden="true"
+                  >
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.6" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M9 6l6 6-6 6" />
+                    </svg>
                   </span>
                   <span className={`group-dot ${stateColorClass[groupState]}`} aria-hidden="true">
                     {stateDot(groupState)}
@@ -782,6 +880,8 @@ function App() {
       <main className="workspace">
         {selected ? (
           <>
+            <SpaceTabs sessions={sessions ?? []} selected={selected} onSelect={setSelectedId} />
+
             <header className="topbar">
               <button
                 type="button"
@@ -790,47 +890,25 @@ function App() {
                 aria-expanded={mobileSidebarOpen}
                 onClick={() => setMobileSidebarOpen(true)}
               >☰</button>
-              <div className="mobile-brand"><div className="brand-mark">H</div></div>
-              <div className={`provider-mark large ${providerOf(selected)}`}>
-                <ProviderLogo provider={providerOf(selected)} />
-              </div>
-              <div className="topbar-title">
-                <div>
-                  <h1>{selected.display_name}</h1>
-                  <span className={`status-pill ${stateColorClass[asState(selected.status)]}`}>
-                    <i /> {stateLabels[asState(selected.status)]}
-                  </span>
-                </div>
-                <p>
-                  {providerLabelOf(selected)} · {selected.workspace ?? "기타"}
-                  {selected.tab_label ? ` · ${selected.tab_label}` : ""}
-                  {selected.pane_id ? ` · ${selected.pane_id}` : " · herdr 밖 세션"}
-                </p>
-              </div>
+              <span className={`status-pill ${stateColorClass[asState(selected.status)]}`}>
+                <i /> {stateLabels[asState(selected.status)]}
+              </span>
+              <h1>{selected.tab_label ?? selected.display_name}</h1>
+              {/* Model and effort are blank on the CLIs that never write them — say nothing
+                  rather than show a "—" the user can't act on. */}
+              <p title={selected.cwd}>
+                {[
+                  providerLabelOf(selected),
+                  timeline?.model,
+                  timeline?.effort,
+                  selected.branch && `⎇ ${selected.branch}`,
+                  shortPath(selected.cwd),
+                ]
+                  .filter(Boolean)
+                  .join(" · ")}
+              </p>
               <button className="quiet-button" aria-label="새로고침" onClick={() => void refreshOutput()}>↻</button>
             </header>
-
-            <section className="briefing">
-              <div className="eyebrow">herdr 라이브 상태</div>
-              <div className="briefing-grid">
-                <div>
-                  <span>현재</span>
-                  <strong className={stateColorClass[asState(selected.status)]}>{stateLabels[asState(selected.status)]}</strong>
-                </div>
-                <div>
-                  <span>작업공간</span>
-                  <strong>
-                    {selected.workspace ?? "기타"}
-                    {selected.tab_label ? ` / ${selected.tab_label}` : ""}
-                    {selected.branch ? ` · ⎇ ${selected.branch}` : ""}
-                  </strong>
-                </div>
-                <div>
-                  <span>경로</span>
-                  <strong title={selected.cwd}>{shortPath(selected.cwd)}</strong>
-                </div>
-              </div>
-            </section>
 
             <section className={`terminal-section ${viewMode}-mode`} aria-label="에이전트 라이브 출력">
               <div className="terminal-heading">
@@ -859,8 +937,8 @@ function App() {
               {viewMode === "chat" ? (
                 timeline ? (
                   <div className="conversation-timeline" ref={conversationRef}>
-                    <div className="timeline-source">Claude transcript · {timeline.length}개 이벤트</div>
-                    {timeline.map((event, index) => (
+                    <div className="timeline-source">Claude transcript · {timeline.items.length}개 이벤트</div>
+                    {timeline.items.map((event, index) => (
                       <article className={`conversation-event ${event.role}`} key={`${index}-${event.ts ?? ""}`}>
                         {event.role === "tool" ? (
                           <div className="tool-card">
@@ -882,7 +960,7 @@ function App() {
                         )}
                       </article>
                     ))}
-                    {timeline.length === 0 && <div className="output-state">표시할 대화 이벤트가 아직 없습니다.</div>}
+                    {timeline.items.length === 0 && <div className="output-state">표시할 대화 이벤트가 아직 없습니다.</div>}
                   </div>
                 ) : (
                   <div className="output-state">대화를 불러오는 중…</div>

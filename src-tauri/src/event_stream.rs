@@ -1,3 +1,34 @@
+//! The herdr Unix-socket layer: the app's live feed, and its only write path.
+//!
+//! Protocol: newline-delimited JSON-RPC over `~/.config/herdr/herdr.sock`
+//! (`HERDR_SOCKET_PATH` / `XDG_CONFIG_HOME` override it). One request per line, one response
+//! per line. Everything here is protocol 16.
+//!
+//! # Two connections, on purpose
+//!
+//! `subscribe_once` opens a throwaway connection for `session.snapshot` to learn which panes
+//! exist, then opens a second one for `events.subscribe` and never returns from it — that
+//! second socket is the event feed, and each line it yields is re-emitted to the webview as a
+//! `herdr-event`. The snapshot must come first because status subscriptions are *pane-scoped*
+//! in protocol 16: you cannot subscribe to "all agent status", only to named panes.
+//!
+//! # Why it deliberately disconnects
+//!
+//! That pane-scoping means a pane created *after* we subscribed has no status subscription, so
+//! its work would be invisible. When `pane.agent_detected` names a pane outside the initial set,
+//! `subscribe_once` returns `Ok(())` — a *planned* teardown. `start()`'s loop immediately
+//! reconnects and rebuilds the subscription list from a fresh snapshot. Detection events for
+//! panes we already track are ignored; treating them as new would reconnect forever.
+//!
+//! So `Ok(())` means "resubscribe now" (50ms, connection stays green) and `Err` means the socket
+//! actually broke (2s backoff, connection goes red). The frontend polls `herdr_event_status` and
+//! falls back to polling `list_sessions` while red — see the README's 실시간 section.
+//!
+//! # Writes
+//!
+//! `send_text_and_enter` is the only way anything leaves this app. Every other backend call is
+//! read-only.
+
 use serde::Serialize;
 #[cfg(unix)]
 use serde_json::{json, Value};
