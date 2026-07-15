@@ -57,8 +57,10 @@
   --tool-fg: #494740;
   --code-bg: #e8e6e0;
   --code-fg: #4a4843;
-  --pre-bg: #272825;
-  --pre-fg: #e6e6df;
+  --pre-bg: #f5f4f0;
+  --pre-fg: #302f2c;
+  --code-header-bg: #efede8;
+  --code-border: #dedbd3;
   --md-heading: #252523;
   --md-border: #dfdcd4;
   --md-quote: #6f6c65;
@@ -141,8 +143,10 @@
   --tool-fg: #cbc7bd;
   --code-bg: #2b2926;
   --code-fg: #d8d5cd;
-  --pre-bg: #1c1b19;
-  --pre-fg: #e6e6df;
+  --pre-bg: #242320;
+  --pre-fg: #e2dfd7;
+  --code-header-bg: #2b2926;
+  --code-border: #3b3832;
   --md-heading: #ece9e2;
   --md-border: #35322c;
   --md-quote: #a6a299;
@@ -308,19 +312,19 @@ button { color: inherit; }
 .chat-mode .view-switcher button.active { color: var(--switch-chat-active-fg); background: var(--switch-chat-active-bg); box-shadow: 0 1px 3px var(--shadow); }
 .conversation-timeline { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 20px max(34px, calc((100% - 760px) / 2)) 36px; background: var(--chat-bg); }
 .timeline-source { margin: 0 0 17px; color: var(--muted); font-size: 10px; text-align: center; }
-.conversation-event { display: flex; margin: 0 0 13px; }
+.conversation-event { min-width: 0; display: flex; margin: 0 0 13px; }
 .conversation-event.user { justify-content: flex-end; }
-.message-card { max-width: 88%; padding: 7px 0 15px; border: 0; border-radius: 0; background: transparent; color: var(--msg-fg); box-shadow: none; }
+.message-card { min-width: 0; max-width: 88%; padding: 7px 0 15px; border: 0; border-radius: 0; background: transparent; color: var(--msg-fg); box-shadow: none; }
 .conversation-event.user .message-card { max-width: 76%; padding: 10px 13px; border-radius: 15px 15px 4px 15px; background: var(--bubble-user); }
 .message-meta { display: flex; justify-content: space-between; gap: 14px; margin-bottom: 7px; color: var(--faint); font-size: 10px; }
 .message-meta strong { color: var(--muted); font-size: 10px; }
-.message-content { position: relative; }
+.message-content { position: relative; min-width: 0; }
 .message-content.collapsed { max-height: 190px; overflow: hidden; }
 .message-content.collapsed::after { content: ""; position: absolute; right: 0; bottom: 0; left: 0; height: 48px; pointer-events: none; background: linear-gradient(transparent, var(--bubble-user)); }
 .message-expand-button { display: flex; align-items: center; justify-content: center; gap: 5px; width: 100%; margin-top: 7px; padding: 6px 8px 2px; border: 0; border-top: 1px solid var(--line); color: var(--muted); background: transparent; cursor: pointer; font-size: 8px; font-weight: 600; }
 .message-expand-button:hover { color: var(--ink); }
 .message-expand-button span { font-size: 10px; }
-.markdown-body { color: inherit; font-size: 13px; line-height: 1.7; overflow-wrap: anywhere; }
+.markdown-body { min-width: 0; color: inherit; font-size: 13px; line-height: 1.7; overflow-wrap: anywhere; }
 .markdown-body > :first-child { margin-top: 0; }
 .markdown-body > :last-child { margin-bottom: 0; }
 .markdown-body p { margin: 0 0 8px; white-space: pre-wrap; }
@@ -335,8 +339,12 @@ button { color: inherit; }
 .markdown-body blockquote { margin: 9px 0; padding: 4px 0 4px 11px; border-left: 3px solid var(--line-soft); color: var(--md-quote); }
 .markdown-body blockquote p { margin: 0; }
 .markdown-body code { padding: 2px 5px; border-radius: 4px; background: var(--code-bg); color: var(--code-fg); font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
-.markdown-body pre { margin: 9px 0; padding: 11px 12px; overflow-x: auto; border-radius: 8px; background: var(--pre-bg); color: var(--pre-fg); }
-.markdown-body pre code { padding: 0; background: transparent; color: inherit; font-size: 12px; }
+.markdown-body .code-block { min-width: 0; margin: 10px 0; overflow: hidden; border: 1px solid var(--code-border); border-radius: 9px; background: var(--pre-bg); }
+.markdown-body .code-block figcaption { min-height: 32px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 0 10px 0 13px; border-bottom: 1px solid var(--code-border); background: var(--code-header-bg); color: var(--muted); font: 10px/1 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; text-transform: lowercase; }
+.markdown-body .code-block figcaption button { padding: 4px 6px; border: 0; border-radius: 5px; background: transparent; color: var(--muted); cursor: pointer; font: 10px/1 Pretendard, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+.markdown-body .code-block figcaption button:hover { background: var(--hover-strong); color: var(--ink); }
+.markdown-body pre { width: 100%; max-width: 100%; margin: 0; padding: 12px 14px; overflow: hidden; border-radius: 0; background: var(--pre-bg); color: var(--pre-fg); white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; tab-size: 2; }
+.markdown-body pre code { display: block; min-width: 0; padding: 0; background: transparent; color: inherit; font-size: 12px; white-space: inherit; overflow-wrap: inherit; word-break: inherit; }
 .markdown-body a { color: var(--link); text-decoration: underline; text-underline-offset: 2px; }
 .markdown-body hr { margin: 13px 0; border: 0; border-top: 1px solid var(--line); }
 .markdown-body table { width: 100%; margin: 9px 0; border-collapse: collapse; font-size: 12px; }
@@ -344,6 +352,9 @@ button { color: inherit; }
 .markdown-body th { background: var(--th-bg); font-weight: 700; }
 .markdown-body input[type="checkbox"] { margin: 0 5px 0 0; accent-color: var(--green); }
 .markdown-body del { color: var(--faint); }
+.mermaid-figure { min-width: 0; margin: 10px 0; padding: 16px; overflow-x: auto; border: 1px solid var(--code-border); border-radius: 9px; background: var(--surface); text-align: center; }
+.mermaid-figure.pending { min-height: 92px; display: grid; place-items: center; color: var(--faint); font-size: 11px; }
+.mermaid-figure svg { display: block; max-width: 100%; height: auto; margin: 0 auto; }
 .conversation-event.tool { display: block; margin-left: 14px; }
 .tool-card { overflow: hidden; border: 1px solid var(--tool-border); border-radius: 9px; background: var(--tool-bg); color: var(--tool-fg); }
 .tool-card > div { display: flex; align-items: center; gap: 7px; padding: 8px 11px; border-bottom: 1px solid var(--tool-border); font-size: 11px; }

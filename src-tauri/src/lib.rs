@@ -993,6 +993,64 @@ fn parse_codex_line(line: &str) -> Vec<TimelineItem> {
     items
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CodexRecordSource {
+    ResponseItem,
+    EventMessage,
+}
+
+/// Codex mirrors human-visible messages into two rollout records: `event_msg` drives the live UI,
+/// while `response_item` is the durable conversation item. Keep both formats as fallbacks, but
+/// reconcile an adjacent mirrored pair into the canonical response item when both are present.
+fn codex_record_source(line: &str) -> Option<CodexRecordSource> {
+    let value: Value = serde_json::from_str(line.trim()).ok()?;
+    let outer = value.get("type").and_then(Value::as_str).unwrap_or("");
+    match outer {
+        "response_item" => Some(CodexRecordSource::ResponseItem),
+        "event_msg" => Some(CodexRecordSource::EventMessage),
+        _ => {
+            let inner = value.get("payload").unwrap_or(&value);
+            match inner.get("type").and_then(Value::as_str).unwrap_or("") {
+                "message" | "function_call" => Some(CodexRecordSource::ResponseItem),
+                "agent_message" | "user_message" => Some(CodexRecordSource::EventMessage),
+                _ => None,
+            }
+        }
+    }
+}
+
+fn parse_codex_transcript(text: &str) -> Vec<TimelineItem> {
+    let mut reconciled: Vec<(TimelineItem, CodexRecordSource)> = Vec::new();
+    for line in text.lines() {
+        let Some(source) = codex_record_source(line) else {
+            continue;
+        };
+        for item in parse_codex_line(line) {
+            let mirrored = reconciled
+                .last()
+                .is_some_and(|(previous, previous_source)| {
+                    *previous_source != source
+                        && previous.role != "tool"
+                        && previous.role == item.role
+                        && previous.text == item.text
+                        && previous.tool_name == item.tool_name
+                });
+            if mirrored {
+                // The two record orders differ by role in current Codex rollouts. Always retain the
+                // response_item so its timestamp and durable representation win either way.
+                if source == CodexRecordSource::ResponseItem {
+                    *reconciled
+                        .last_mut()
+                        .expect("mirrored item has a predecessor") = (item, source);
+                }
+                continue;
+            }
+            reconciled.push((item, source));
+        }
+    }
+    reconciled.into_iter().map(|(item, _)| item).collect()
+}
+
 /// The messages of a gemini conversation file, in order. Three on-disk shapes:
 ///   - logs.json — a bare array of {type, message} (user prompts only)
 ///   - chats/*.json (older CLI) — one document, {messages: [...]}
@@ -1157,7 +1215,7 @@ fn get_timeline(transcript_path: String, last: usize) -> Result<Timeline, String
         }
         "codex" => {
             let text = read_tail(&path_str)?;
-            let items = text.lines().flat_map(parse_codex_line).collect();
+            let items = parse_codex_transcript(&text);
             let (model, effort) = codex_model(&text);
             (items, model, effort)
         }
@@ -1501,6 +1559,48 @@ mod tests {
         assert_eq!(model.as_deref(), Some("gpt-5.6-sol"));
         assert_eq!(effort.as_deref(), Some("medium"));
         assert_eq!(codex_model(r#"{"type":"event_msg"}"#), (None, None));
+    }
+
+    #[test]
+    fn codex_timeline_reconciles_mirrored_messages_in_both_orders() {
+        let text = [
+            // Assistant commentary is currently event_msg first, response_item second.
+            r#"{"timestamp":"2026-07-15T06:21:08.113Z","type":"event_msg","payload":{"type":"agent_message","message":"진행 중입니다"}}"#,
+            r#"{"timestamp":"2026-07-15T06:21:08.114Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"진행 중입니다"}]}}"#,
+            // User messages are currently written in the opposite order.
+            r#"{"timestamp":"2026-07-15T06:25:24.001Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"수정해줘"}]}}"#,
+            r#"{"timestamp":"2026-07-15T06:25:24.002Z","type":"event_msg","payload":{"type":"user_message","message":"수정해줘"}}"#,
+        ]
+        .join("\n");
+
+        let items = parse_codex_transcript(&text);
+
+        assert_eq!(items.len(), 2, "mirrored rollout records must render once");
+        assert_eq!(items[0].role, "assistant");
+        assert_eq!(items[0].text, "진행 중입니다");
+        assert_eq!(items[0].ts.as_deref(), Some("2026-07-15T06:21:08.114Z"));
+        assert_eq!(items[1].role, "user");
+        assert_eq!(items[1].text, "수정해줘");
+        assert_eq!(items[1].ts.as_deref(), Some("2026-07-15T06:25:24.001Z"));
+    }
+
+    #[test]
+    fn codex_timeline_keeps_fallbacks_and_intentional_repeats() {
+        let text = [
+            // Older/in-flight rollouts may have only the event form, so it must remain visible.
+            r#"{"type":"event_msg","payload":{"type":"agent_message","message":"잠시만요"}}"#,
+            // Same-source repeats are separate conversation messages, not mirrored records.
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"완료"}]}}"#,
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"완료"}]}}"#,
+        ]
+        .join("\n");
+
+        let items = parse_codex_transcript(&text);
+
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].text, "잠시만요");
+        assert_eq!(items[1].text, "완료");
+        assert_eq!(items[2].text, "완료");
     }
 
     #[test]

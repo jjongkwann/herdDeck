@@ -323,10 +323,124 @@ function useStoredKeys(storageKey: string) {
   return [keys, toggle, update] as const;
 }
 
-function MarkdownMessage({ content, collapsible = false }: { content: string; collapsible?: boolean }) {
+let mermaidSeq = 0;
+let mermaidQueue: Promise<void> = Promise.resolve();
+const mermaidCache = new Map<string, Promise<string>>();
+
+/** Mermaid has global configuration, so serialize light/dark renders and cache their sanitized SVG.
+ *  Most importantly, the SVG is now part of React's HTML value instead of an imperative DOM patch;
+ *  a transcript refresh can no longer restore the original ```mermaid fence behind React's back. */
+function mermaidSvg(source: string, theme: "light" | "dark") {
+  const cacheKey = `${theme}\u0000${source}`;
+  const cached = mermaidCache.get(cacheKey);
+  if (cached) return cached;
+
+  const task = mermaidQueue.then(async () => {
+    const { default: mermaid } = await import("mermaid");
+    // htmlLabels:false keeps labels in SVG <text>; foreignObject would reopen an HTML/mXSS
+    // integration point for transcript content that must be treated as adversarial.
+    mermaid.initialize({
+      startOnLoad: false,
+      securityLevel: "strict",
+      htmlLabels: false,
+      flowchart: { htmlLabels: false },
+      theme: theme === "dark" ? "dark" : "default",
+    });
+    const id = `mmd-${mermaidSeq++}`;
+    try {
+      const { svg } = await mermaid.render(id, source);
+      return DOMPurify.sanitize(svg);
+    } catch (error) {
+      document.getElementById(id)?.remove();
+      throw error;
+    }
+  });
+
+  mermaidQueue = task.then(() => undefined, () => undefined);
+  mermaidCache.set(cacheKey, task);
+  void task.then(
+    () => {
+      // Diagrams recur frequently in a transcript, but an unlimited process-lifetime cache does not.
+      while (mermaidCache.size > 100) mermaidCache.delete(mermaidCache.keys().next().value!);
+    },
+    () => {
+      if (mermaidCache.get(cacheKey) === task) mermaidCache.delete(cacheKey);
+    },
+  );
+  return task;
+}
+
+function markdownTemplate(content: string) {
+  const template = document.createElement("template");
+  template.innerHTML = DOMPurify.sanitize(marked.parse(content, { async: false }) as string);
+  return template;
+}
+
+/** Give fenced content Codex-like, neutral chrome and wrapping instead of a terminal-black slab. */
+function decorateCodeBlocks(root: DocumentFragment) {
+  for (const pre of [...root.querySelectorAll("pre")]) {
+    if (pre.closest(".code-block")) continue;
+    const code = pre.querySelector(":scope > code");
+    if (!code) continue;
+    const languageClass = [...code.classList].find((name) => name.startsWith("language-"));
+    const language = languageClass?.slice("language-".length) || "text";
+    const figure = document.createElement("figure");
+    figure.className = `code-block ${language === "text" || language === "plaintext" ? "plain" : ""}`.trim();
+    const caption = document.createElement("figcaption");
+    const label = document.createElement("span");
+    label.textContent = language;
+    const copy = document.createElement("button");
+    copy.type = "button";
+    copy.dataset.copyCode = "";
+    copy.textContent = "복사";
+    caption.append(label, copy);
+    pre.replaceWith(figure);
+    figure.append(caption, pre);
+  }
+}
+
+function initialMarkdownHtml(content: string) {
+  const template = markdownTemplate(content);
+  for (const pre of [...template.content.querySelectorAll("pre")]) {
+    if (!pre.querySelector(":scope > code.language-mermaid")) continue;
+    const pending = document.createElement("div");
+    pending.className = "mermaid-figure pending";
+    pending.setAttribute("role", "status");
+    pending.textContent = "차트 그리는 중…";
+    pre.replaceWith(pending);
+  }
+  decorateCodeBlocks(template.content);
+  return template.innerHTML;
+}
+
+async function renderedMarkdownHtml(content: string, theme: "light" | "dark") {
+  const template = markdownTemplate(content);
+  const mermaidBlocks = [...template.content.querySelectorAll("pre")]
+    .map((pre) => ({ pre, code: pre.querySelector(":scope > code.language-mermaid") }))
+    .filter((block): block is { pre: HTMLPreElement; code: HTMLElement } => Boolean(block.code));
+
+  await Promise.all(mermaidBlocks.map(async ({ pre, code }) => {
+    try {
+      const figure = document.createElement("div");
+      figure.className = "mermaid-figure";
+      figure.innerHTML = await mermaidSvg(code.textContent ?? "", theme);
+      pre.replaceWith(figure);
+    } catch {
+      // Invalid Mermaid remains available as an ordinary, readable source block.
+    }
+  }));
+  decorateCodeBlocks(template.content);
+  return template.innerHTML;
+}
+
+function MarkdownMessage({ content, theme, collapsible = false }: { content: string; theme: "light" | "dark"; collapsible?: boolean }) {
   const contentRef = useRef<HTMLDivElement | null>(null);
   const [expanded, setExpanded] = useState(false);
   const [canCollapse, setCanCollapse] = useState(false);
+  const initialHtml = useMemo(() => initialMarkdownHtml(content), [content]);
+  const htmlKey = `${theme}\u0000${content}`;
+  const [renderedHtml, setRenderedHtml] = useState({ key: htmlKey, html: initialHtml });
+  const html = renderedHtml.key === htmlKey ? renderedHtml.html : initialHtml;
 
   useLayoutEffect(() => {
     const element = contentRef.current;
@@ -341,16 +455,34 @@ function MarkdownMessage({ content, collapsible = false }: { content: string; co
     return () => observer.disconnect();
   }, [collapsible, content]);
 
-  // Transcripts can quote arbitrary web content, and this webview can send messages
-  // into live sessions — never render markdown without sanitizing it first.
-  const html = useMemo(
-    () => DOMPurify.sanitize(marked.parse(content, { async: false }) as string),
-    [content],
-  );
+  useEffect(() => {
+    let cancelled = false;
+    void renderedMarkdownHtml(content, theme).then((rendered) => {
+      if (!cancelled) setRenderedHtml({ key: htmlKey, html: rendered });
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [content, htmlKey, theme]);
+
+  const copyCode = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
+    const button = (event.target as Element).closest<HTMLButtonElement>("button[data-copy-code]");
+    if (!button) return;
+    const source = button.closest(".code-block")?.querySelector("pre code")?.textContent;
+    if (source == null) return;
+    void navigator.clipboard.writeText(source).then(() => {
+      button.textContent = "복사됨";
+      window.setTimeout(() => {
+        if (button.isConnected) button.textContent = "복사";
+      }, 1_400);
+    }).catch(() => {
+      button.textContent = "복사 실패";
+    });
+  }, []);
 
   return (
     <>
-      <div className={`message-content ${canCollapse && !expanded ? "collapsed" : ""}`} ref={contentRef}>
+      <div className={`message-content ${canCollapse && !expanded ? "collapsed" : ""}`} ref={contentRef} onClick={copyCode}>
         <div className="markdown-body" dangerouslySetInnerHTML={{ __html: html }} />
       </div>
       {canCollapse && (
@@ -424,6 +556,7 @@ function App() {
   const revisionRef = useRef<number>(0);
   const conversationRef = useRef<HTMLDivElement | null>(null);
   const terminalRef = useRef<HTMLPreElement | null>(null);
+  const pinnedToBottomRef = useRef({ chat: true, terminal: true });
   const selectedIdRef = useRef<string | null>(null);
   const pointerDragRef = useRef<{ key: string; pointerId: number; startY: number; active: boolean } | null>(null);
   const suppressWorkspaceClickRef = useRef(false);
@@ -677,8 +810,9 @@ function App() {
   useEffect(() => {
     const scrollToLatest = () => {
       const target = viewMode === "chat" ? conversationRef.current : terminalRef.current;
-      if (target) target.scrollTop = target.scrollHeight;
+      if (target && pinnedToBottomRef.current[viewMode]) target.scrollTop = target.scrollHeight;
     };
+    pinnedToBottomRef.current[viewMode] = true;
     scrollToLatest();
     let secondFrame = 0;
     const firstFrame = window.requestAnimationFrame(() => {
@@ -691,7 +825,17 @@ function App() {
       window.cancelAnimationFrame(secondFrame);
       window.clearTimeout(settledLayout);
     };
-  }, [output, selectedId, timeline, viewMode]);
+  }, [selectedId, viewMode]);
+
+  useEffect(() => {
+    if (!pinnedToBottomRef.current[viewMode]) return;
+    const target = viewMode === "chat" ? conversationRef.current : terminalRef.current;
+    if (target) target.scrollTop = target.scrollHeight;
+  }, [output, timeline, viewMode]);
+
+  const trackBottomPin = useCallback((mode: "chat" | "terminal", element: HTMLElement) => {
+    pinnedToBottomRef.current[mode] = element.scrollHeight - element.scrollTop - element.clientHeight < 96;
+  }, []);
 
   useEffect(() => {
     let disposed = false;
@@ -1059,7 +1203,11 @@ function App() {
 
               {viewMode === "chat" ? (
                 timeline ? (
-                  <div className="conversation-timeline" ref={conversationRef}>
+                  <div
+                    className="conversation-timeline"
+                    ref={conversationRef}
+                    onScroll={(event) => trackBottomPin("chat", event.currentTarget)}
+                  >
                     <div className="timeline-source">Claude transcript · {timeline.items.length}개 이벤트</div>
                     {timeline.items.map((event, index) => (
                       <article className={`conversation-event ${event.role}`} key={`${index}-${event.ts ?? ""}`}>
@@ -1078,7 +1226,7 @@ function App() {
                               <strong>{event.role === "user" ? "나" : providerLabelOf(selected)}</strong>
                               <time>{formatEventTime(event.ts)}</time>
                             </div>
-                            <MarkdownMessage content={event.text} collapsible={event.role === "user"} />
+                            <MarkdownMessage content={event.text} theme={theme} collapsible={event.role === "user"} />
                           </div>
                         )}
                       </article>
@@ -1091,7 +1239,11 @@ function App() {
               ) : outputError ? (
                 <div className="output-state error-state">{outputError}</div>
               ) : output !== null ? (
-                <pre className="terminal-output" ref={terminalRef}>{output || "아직 표시할 출력이 없습니다."}</pre>
+                <pre
+                  className="terminal-output"
+                  ref={terminalRef}
+                  onScroll={(event) => trackBottomPin("terminal", event.currentTarget)}
+                >{output || "아직 표시할 출력이 없습니다."}</pre>
               ) : (
                 <div className="output-state">최근 출력을 불러오는 중…</div>
               )}
